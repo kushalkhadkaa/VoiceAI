@@ -1,104 +1,149 @@
 # SwarLocal (स्वरा लोकल)
+### *The Local-First, Privacy-Preserving Voice AI Assistant for Nepali and English*
 
-SwarLocal is a local-first, low-latency voice AI assistant for macOS supporting both **Nepali and English** speech. Built with a FastAPI backend, a premium React/Vite/TypeScript frontend, and SQLite telemetry, SwarLocal operates fully offline to respect user privacy while providing modular hooks for cloud models, RAG (Retrieval-Augmented Generation), and web search.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Platform: macOS](https://img.shields.io/badge/Platform-macOS-apple.svg)](https://www.apple.com/macos/)
+[![Python: 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
+[![TypeScript: 5.0](https://img.shields.io/badge/TypeScript-5.0-blue.svg)](https://www.typescriptlang.org/)
+
+SwarLocal is a local-first, low-latency voice AI assistant designed for macOS that seamlessly integrates **Nepali and English** speech. By combining a high-performance FastAPI backend, a premium React/Vite/TypeScript frontend, and SQLite telemetry, SwarLocal runs fully offline on your Apple Silicon or Intel MacBook. 
+
+Whether you are query-searching local files, archiving native dialects, or training consent-based voice models, SwarLocal puts you in absolute control of your data.
 
 ---
 
-## 🚀 Key Features
+## 🌟 Executive Product Features
 
-### 1. Hybrid Mixed-Language Routing
-- **Dual-Language Speech Synthesis**: Sentence-level language routing splits inputs into Nepali and English fragments dynamically using Unicode heuristics and script checks.
-- **Dynamic TTS Routing**: Directs English fragments to English models and Nepali fragments to Nepali models, ensuring clean pronunciation for code switching and loanwords.
-- **Single-Model Fallback**: Option to synthesize all text with a single bilingual voice model if desired.
+### 1. Hybrid Mixed-Language Routing (Heuristic Script Parsing)
+SwarLocal is optimized for bilingual speakers who switch between Nepali and English in a single sentence:
+* **Dynamic Sentence Chunking**: A custom Language Router scans incoming text, detects script boundaries (Devanagari vs. Latin), and splits sentences into localized chunks.
+* **Smart TTS Routing**: English phrases are automatically synthesized using high-quality English voice artifacts, while Nepali terms route directly to native Devanagari voice engines, preventing broken pronunciations and garbled speech.
+* **Bilingual Fallback**: Switch between separate specialized models or a single unified multilingual voice at the press of a toggle.
 
 ### 2. Multi-Engine Voice Pipeline
-- **STT (Speech-to-Text)**: Local transcription powered by `Faster-Whisper` running on CPU or macOS MPS (Metal Performance Shaders).
-- **LLM Reasoning**: Supports local Ollama engines (defaulting to `qwen2.5:7b` and `gemma3:4b` fallbacks) or cloud providers (OpenAI `gpt-4o-mini`, Google Gemini `gemini-1.5-flash`).
-- **TTS (Text-to-Speech)**: Handles Piper local synthesis, Chatterbox local zero-shot voice cloning, and ElevenLabs cloud synthesis.
+Built for off-grid operations but customizable with modern cloud APIs:
+* **STT (Speech-to-Text)**: Local, high-performance transcription powered by `Faster-Whisper` using macOS MPS (Metal Performance Shaders) or CPU acceleration.
+* **LLM Reasoning**: Modular routing defaults to local Ollama models (e.g., `qwen2.5:7b` for reasoning and `gemma3:4b` as a lightweight fallback). Secure hooks allow routing to cloud models (OpenAI `gpt-4o-mini`, Google Gemini `gemini-1.5-flash`).
+* **TTS (Text-to-Speech)**: Local synthesis through Piper (`.onnx` exports), local zero-shot voice cloning with Chatterbox, and high-fidelity cloud voices via ElevenLabs.
 
-### 3. Voice Studio & Dataset Creator
-- **Consent-First Design**: Requires explicit user consent, signature, and spoken recordings before voice dataset creation or model training.
-- **Audio Processing & Quality Verification**: Denoising, loudness normalization, silence trimming, and speaker similarity validation are integrated.
-- **Zero-Shot & Fine-Tuning**: Clones voices locally with Chatterbox or registers datasets for Piper model training.
+### 3. Voice Studio & Quality Validation
+A clean, consent-based environment for custom voice profiling:
+* **Consent-First Architecture**: Strictly blocks voice model cloning until an explicit digital signature and a spoken recording verify ownership.
+* **Real-time Quality Scoring**: Automatically scores audio samples based on peak amplitude, RMS noise floors, and silence boundaries.
+* **Integrated DSP Cleanup**: Automatic background noise reduction, loudness normalization, and silence trimming using FFmpeg and local DSP libraries.
 
-### 4. Retrieval-Augmented Generation (RAG) & Web Search
-- **Open WebUI Hook**: Synchronizes with a local Open WebUI RAG pipeline for custom document indexing.
-- **Web Search Integration**: Auto-triggers DuckDuckGo web retrieval for temporal questions, appending real-time context and citation metadata.
-
-### 5. Persistent Telemetry & Manual Evaluation
-- **Database History**: All conversation turns, latencies (STT, LLM first-token, TTS generation, and total roundtrip ms), citations, and settings are written to a local SQLite database (`.local/swarlocal.db`).
-- **Manual QA Panel**: Rate voice naturalness, pronunciation, and similarity to log model behavior in the database.
+### 4. RAG (Retrieval-Augmented Generation) & Smart Web Search
+* **Local Document Sync**: Connects directly to local Open WebUI databases to search through your PDFs, markdown notes, and personal documents.
+* **DuckDuckGo Context Retrieval**: Auto-triggers search queries for temporal questions (e.g., *"What is the weather today in Kathmandu?"*), injecting citations and context directly into local prompts.
 
 ---
 
-## 🛠 System Architecture
+## 🛠 System Architecture & Data Flow
 
 ```mermaid
-graph TD
-    User([User Voice/Text]) --> Frontend[React + Vite Frontend]
-    Frontend -->|WebSocket / HTTP| Backend[FastAPI Server]
-    
-    subgraph Voice Pipeline
-        Backend --> STT[Faster Whisper STT]
-        Backend --> Router[Language Router]
-        Backend --> LLM{Brain Routing}
-        LLM -->|Local| Ollama[Ollama Server]
-        LLM -->|Cloud| CloudLLM[OpenAI / Gemini]
-        Backend --> TTS{TTS Router}
-        TTS -->|Local| Piper[Piper TTS]
-        TTS -->|Zero-Shot| Chatterbox[Chatterbox TTS]
-        TTS -->|Cloud| ElevenLabs[ElevenLabs TTS]
+flowchart TB
+    %% User Inputs
+    User([User Speech / Text]) -->|Microphone / Keyboard| UI[React/TypeScript Web UI]
+    UI -->|WebSocket / HTTP| API[FastAPI Gateway]
+
+    %% Middleware
+    subgraph SwarLocal Core Runtime
+        API --> VAD[Voice Activity Detector]
+        API --> STT[Faster Whisper STT Engine]
+        API --> Router[Bilingual Language Router]
+        API --> SQLite[(SQLite Database)]
     end
-    
-    subgraph Data & Context
-        Backend --> SQLite[(SQLite Telemetry & Consents)]
-        Backend --> RAG[Open WebUI RAG]
-        Backend --> Web[Web Retrieval Provider]
+
+    %% Reasoning Engines
+    subgraph LLM Reasoning Layer
+        Router -->|Query Context| Brain{Brain Selector}
+        Brain -->|Offline Local| Ollama[Ollama: Qwen / Gemma]
+        Brain -->|Online Cloud| CloudLLM[OpenAI / Google Gemini]
+        Brain -->|RAG Hook| WebUI[Open WebUI Document DB]
+        Brain -->|Web Search| DDG[DuckDuckGo Retrieval]
     end
-    
-    Backend --> Frontend
+
+    %% Output Synthesis
+    subgraph TTS Synthesis Layer
+        Ollama & CloudLLM & WebUI & DDG -->|Text Answer| TTSRouter{TTS Selector}
+        TTSRouter -->|Local ONNX| Piper[Piper TTS Engine]
+        TTSRouter -->|Zero-Shot Local| Chatterbox[Chatterbox Zero-Shot Clone]
+        TTSRouter -->|Cloud API| Eleven[ElevenLabs Cloud TTS]
+    end
+
+    %% Output Loop
+    Piper & Chatterbox & Eleven -->|WAV Audio stream| API
+    API -->|Audio + Telemetry| UI
+    UI -->|Speaker Playback| Playback([Natural Audio Output])
 ```
 
 ---
 
-## 💻 macOS Installation & Setup
+## 💡 Real-World Use Cases
+
+### Use Case 1: The Privacy-First Executive Assistant
+* **The Scenario**: A developer needs to consult sensitive codebase documents, personal journals, or financial spreadsheets hands-free during deep work.
+* **How SwarLocal Solves It**: By running Ollama and Open WebUI entirely on-device, the assistant processes document lookups and reads answers aloud without uploading a single byte to the internet.
+
+### Use Case 2: Dialect & Accent Preservation
+* **The Scenario**: Linguists and speech researchers want to preserve specific Nepalese regional accents (such as Chitwan or Kathmandu valley dialects) and export clean datasets.
+* **How SwarLocal Solves It**: Voice Studio provides a guided environment for recording native prompts, validating audio quality, normalising volume levels, and exporting structured, metadata-indexed `.zip` datasets for training.
+
+### Use Case 3: Hands-Free Development & Dictation
+* **The Scenario**: A developer wants to talk to their IDE, dictate comments in mixed Nepali/English, and hear build results while typing.
+* **How SwarLocal Solves It**: WebSocket audio streams support low-latency Push-To-Talk and Auto-VAD. The assistant transcribes, reasons, and speaks back build statuses or code documentation with minimal latency.
+
+---
+
+## 📖 A Day in the Life of a SwarLocal Developer
+> *Meet Aayush, a software developer building local automation tools in Lalitpur.*
+>
+> "Every morning, I launch SwarLocal on my MacBook Pro. Because I work with a mix of English codebases and Nepali team notes, standard voice assistants struggle to understand me. 
+> 
+> With SwarLocal, I ask: *'यो function को latency check गर र tell me what needs optimization.'* The system detects my language switch, queries my local RAG files for performance guidelines, and speaks back: *'तपाईंको function ले SQLite connection handle गर्दा wait time बढाएको छ.'* 
+> 
+> All of this happens completely offline, so my client's code remains completely secure on my machine. When I want to experiment with my own voice, I open **Voice Studio**, sign the consent form, record a few sentences, and immediately test a local zero-shot version of myself reading my markdown files."
+
+---
+
+## 💻 macOS Installation & Configuration
 
 ### Prerequisites
-- **macOS** with Apple Silicon or Intel Core
-- **Python 3.11** (recommended version)
+- **macOS** (Apple Silicon M1/M2/M3 or Intel Core)
+- **Python 3.11** (required runtime)
 - **Node.js 20+** and npm
-- **ffmpeg** (required for audio conversions)
-- **Ollama** (local LLM manager)
+- **ffmpeg** (essential for audio transcoding)
+- **Ollama** (offline LLM backend)
 
 ### 1. Install System Dependencies
 ```bash
 brew install ffmpeg
 ```
 
-### 2. Install and Start Ollama
-Download and run the official app from [ollama.com](https://ollama.com) or install via terminal:
+### 2. Download and Configure Ollama
+Ensure Ollama is running, then pull the primary reasoning models:
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
-```
-Start Ollama and fetch the required reasoning models:
-```bash
 ollama pull qwen2.5:7b
 ollama pull gemma3:4b
 ```
 
-### 3. Clone and Initialize Project
-Clone the repository and prepare your environment settings:
+### 3. Initialize SwarLocal
+Prepare your configuration profile and install environment packages:
 ```bash
+# Copy settings template
 cp .env.example .env
+
+# Install backend python environment and frontend npm dependencies
 make setup
 ```
 
-### 4. Download Recommended Piper Voice Models
-Run the setup download script to pull Nepalese and English Piper voices into your models cache:
+### 4. Fetch Piper Voice Files
+Download Nepalese and English Piper models to the cache directory:
 ```bash
 make download-piper-voices
 ```
-Your voices directory should look like this:
+This prepares the following local layout:
 ```text
 models/
 └── piper/
@@ -108,64 +153,102 @@ models/
     └── en_US-lessac-medium.onnx.json
 ```
 
-### 5. Validate the Setup (Doctor Check)
-Confirm all local dependencies, directories, and files are present and active:
+### 5. Run Local Diagnostics
+Run the system doctor checks to verify files, configurations, and models:
 ```bash
 make doctor
 ```
+Once the doctor output reports **`READY`**, launch the development servers:
+```bash
+make dev
+```
+Open your browser and visit: `http://127.0.0.1:5173`
 
 ---
 
-## 👨‍💻 Development Commands
+## 👨‍💻 Workspace Makefile Commands
 
-SwarLocal uses a modular `Makefile` to handle development, testing, and formatting:
+SwarLocal utilizes a simple, structured `Makefile` for local automation:
 
-| Target Command | Description |
-| :--- | :--- |
-| `make dev` | Launches backend (Uvicorn: `8000`) and frontend (Vite: `5173`) in parallel |
-| `make test` | Runs Python unit tests and verifies SQLite database operations |
-| `make lint` | Performs backend syntax validation and typechecks the React code |
-| `make doctor` | Diagnoses local models, directories, configurations, and API paths |
-| `make e2e` | Runs an end-to-end local text-to-speech and logic smoke test |
-| `make ui-test` | Runs static layout, theme contrast, responsive design, and UX contract tests |
-| `make setup-voice-clone` | Installs system dependencies for local Chatterbox voice cloning |
-| `make clean` | Wipes build targets, testing cache files, and coverage outputs |
-
----
-
-## 🔌 API Documentation
-
-SwarLocal exposes a FastAPI Swagger UI at `http://127.0.0.1:8000/docs`. Key routes are:
-
-### Core & Settings
-- `GET /health` - Checks backend lifecycle status.
-- `GET /settings` / `POST /settings` - Retrieves or updates active configurations.
-- `DELETE /local-data` - Cleans local temporary turn directories and clears SQLite logs.
-
-### AI Reasoning & Providers
-- `GET /ai-providers` - Lists Ollama, OpenAI, and Gemini brains.
-- `POST /ai-providers/test/{provider}` - Validates API key and reports response latency.
-- `POST /settings/ai-provider` - Saves API key credentials in encrypted runtime profiles.
-
-### Chat & Voice Socket
-- `POST /chat/test` - Performs a single-turn text-to-speech HTTP test.
-- `GET /chat/history` - Returns persistent conversation turns with latencies, citations, and ratings.
-- `POST /chat/turns/{turn_id}/rate` - Attaches manual Naturalness, Similarity, and Pronunciation ratings to a turn.
-- `WS /ws/voice` - Real-time audio socket handling Push-To-Talk and streaming response.
-
-### Voice Studio & Datasets
-- `GET /voices` - Inspects details on all active Piper, cloud, and cloned custom voices.
-- `POST /voices/create` - Initializes a new voice profile (Nepali, English, or Mixed).
-- `POST /voices/{voice_id}/consent` - Uploads required signature and vocal consent file.
-- `POST /voices/{voice_id}/recordings/{prompt_id}` - Uploads, cleans, and runs quality checks on vocal samples.
-- `POST /voices/{voice_id}/clone` - Compiles recorded samples and builds model configurations.
-- `POST /voices/{voice_id}/publish` - Publishes the voice to the global workspace selector.
+| Command | Lifecycle Phase | Details |
+| :--- | :--- | :--- |
+| **`make dev`** | Development | Runs both FastAPI backend (`8000`) and Vite dev server (`5173`) in reload mode. |
+| **`make test`** | Quality Assurance | Runs unittest suites validating routing, database entries, and audio helpers. |
+| **`make lint`** | Code Standards | Compiles Python files and runs TypeScript type checking (`tsc --noEmit`). |
+| **`make doctor`** | Diagnostics | Verifies local folders, configurations, and active Ollama/Whisper backends. |
+| **`make e2e`** | Integration | Simulates audio turn pipeline end-to-end to ensure TTS/STT runtimes are healthy. |
+| **`make ui-test`** | Frontend UX | Performs static checks validating dark-mode contrast, responsive elements, and accessibility controls. |
+| **`make setup-voice-clone`**| Optional Feature | Installs requirements for Chatterbox local voice cloning. |
+| **`make clean`** | Cleanup | Cleans output caches, coverage files, and compiled assets. |
 
 ---
 
-## 🔒 Privacy & Boundaries
+## 🔌 API Developer Directory
 
-1. **Local-First Processing**: By default, no audio clips, speech transcripts, or reasoning loops leave your macOS machine. 
-2. **Consent Requirement**: Model cloning requires an signed consent agreement. Voice profiles cannot be processed or finalized without verified signature credentials.
-3. **No Voice Spoofing**: SwarLocal does not implement workflows for cloning third-party voices without consent. All training loops are built for user-owned datasets.
-4. **Data Lifecycle**: Voice recordings, database metrics, and logs are cached under `.local/` (which is excluded from Git). You can clear all cached assets instantly in the settings tab.
+SwarLocal features a FastAPI Swagger UI at `http://127.0.0.1:8000/docs`. Key developer endpoints are:
+
+<details>
+<summary><b>1. Core Settings & Telemetry</b></summary>
+
+* `GET /health`: Health status.
+* `GET /settings` / `POST /settings`: Handles application variables.
+* `DELETE /local-data`: Clears temporary audio files and resets SQLite logs.
+</details>
+
+<details>
+<summary><b>2. AI Reasoning Providers</b></summary>
+
+* `GET /ai-providers`: Enumerates available reasoning brains.
+* `POST /ai-providers/test/{provider}`: Evaluates latency for local or cloud credentials.
+* `POST /settings/ai-provider`: Permanently writes API credentials to local config.
+</details>
+
+<details>
+<summary><b>3. Real-Time Conversation</b></summary>
+
+* `POST /chat/test`: Sends text and returns a synthesized WAV audio link.
+* `GET /chat/history`: Returns persistent SQLite-backed conversation turns, timing statistics, and manual ratings.
+* `POST /chat/turns/{turn_id}/rate`: Updates manual evaluations for naturalness, voice similarity, and pronunciation.
+* `WS /ws/voice`: Streaming WebSocket handling real-time push-to-talk microphone audio.
+</details>
+
+<details>
+<summary><b>4. Voice Studio & Datasets</b></summary>
+
+* `GET /voices`: Returns active Piper, cloud, and cloned custom voices.
+* `POST /voices/create`: Registers a new voice profile (Nepali, English, or Mixed).
+* `POST /voices/{voice_id}/consent`: Saves text and spoken consent files.
+* `POST /voices/{voice_id}/recordings/{prompt_id}`: Uploads a sample, runs DSP quality gates, and logs metadata.
+* `POST /voices/{voice_id}/clone`: Compiles sample dataset and builds zero-shot models.
+</details>
+
+---
+
+## 🤝 How to Contribute
+
+We welcome contributions from open-source developers! Here is how you can help make SwarLocal better:
+
+### Technical Contribution Pathways
+1. **Audio Enhancement & DSP**: Improve the background noise reduction algorithm inside `noise_reduction.py` or loudness adjustments in `audio_enhancement.py`.
+2. **Language Routing Optimization**: Tune unicode heuristics in `language_router.py` to better handle slang, emojis, or code-switched terms.
+3. **Turn Detection (VAD)**: Enhance `turn_detector.py` to better ignore room noise, breathing, and background whispers.
+4. **Model Integrations**: Add support for new local models like F5-TTS, OpenVoice, or local Whisper variants.
+
+### Development Workflow
+1. **Fork and Branch**: Create a feature branch from `main`.
+2. **Implement & Test**: Write clear code with tests, then run quality checks:
+   ```bash
+   make lint
+   make test
+   make ui-test
+   ```
+3. **Commit & Push**: Follow professional git conventions (e.g. `feat: improve vad sensitivity`).
+4. **Submit PR**: Describe the performance improvements, provide test logs, and link open issues.
+
+---
+
+## 🔒 Security & Data Guidelines
+
+* **Local Sandboxing**: No transcripts, voice recordings, or reasoning logs leave your machine. The app runs offline by default.
+* **Consent Verification**: Custom voice profiles cannot be cloned without verifying the signature and voice consent statements in SQLite.
+* **Personal Data Protection**: Generated audio tracks, dataset exports, and SQLite logs reside inside the `.local/` directory (excluded from Git).
