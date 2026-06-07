@@ -1,156 +1,171 @@
-# SwarLocal
+# SwarLocal (स्वरा लोकल)
 
-Local-first macOS voice AI assistant for Nepali and English.
+SwarLocal is a local-first, low-latency voice AI assistant for macOS supporting both **Nepali and English** speech. Built with a FastAPI backend, a premium React/Vite/TypeScript frontend, and SQLite telemetry, SwarLocal operates fully offline to respect user privacy while providing modular hooks for cloud models, RAG (Retrieval-Augmented Generation), and web search.
 
-The MVP records microphone audio in a React/Vite frontend, transcribes with Faster Whisper, chats with a local Ollama model, and speaks back with language-routed Piper voices.
+---
 
-## What It Builds
+## 🚀 Key Features
 
-- Nepali and English voice turns through separate Piper voices.
-- Mixed-language routing by script heuristics and Whisper metadata.
-- FastAPI REST endpoints and WebSocket voice conversation.
-- Setup checks for backend, Ollama, Piper, voices, ffmpeg, and microphone.
-- A **My Voice Dataset** screen for consent-based recording and Piper dataset export.
-- Training notes for two future same-speaker voices:
-  - `myvoice_ne_NP_medium.onnx`
-  - `myvoice_en_US_medium.onnx`
+### 1. Hybrid Mixed-Language Routing
+- **Dual-Language Speech Synthesis**: Sentence-level language routing splits inputs into Nepali and English fragments dynamically using Unicode heuristics and script checks.
+- **Dynamic TTS Routing**: Directs English fragments to English models and Nepali fragments to Nepali models, ensuring clean pronunciation for code switching and loanwords.
+- **Single-Model Fallback**: Option to synthesize all text with a single bilingual voice model if desired.
 
-## macOS Setup
+### 2. Multi-Engine Voice Pipeline
+- **STT (Speech-to-Text)**: Local transcription powered by `Faster-Whisper` running on CPU or macOS MPS (Metal Performance Shaders).
+- **LLM Reasoning**: Supports local Ollama engines (defaulting to `qwen2.5:7b` and `gemma3:4b` fallbacks) or cloud providers (OpenAI `gpt-4o-mini`, Google Gemini `gemini-1.5-flash`).
+- **TTS (Text-to-Speech)**: Handles Piper local synthesis, Chatterbox local zero-shot voice cloning, and ElevenLabs cloud synthesis.
 
-Prerequisites:
+### 3. Voice Studio & Dataset Creator
+- **Consent-First Design**: Requires explicit user consent, signature, and spoken recordings before voice dataset creation or model training.
+- **Audio Processing & Quality Verification**: Denoising, loudness normalization, silence trimming, and speaker similarity validation are integrated.
+- **Zero-Shot & Fine-Tuning**: Clones voices locally with Chatterbox or registers datasets for Piper model training.
 
-- Python 3.11 or newer
-- Node.js 20 or newer
-- ffmpeg
-- Ollama
-- Piper voice `.onnx` and `.onnx.json` files
+### 4. Retrieval-Augmented Generation (RAG) & Web Search
+- **Open WebUI Hook**: Synchronizes with a local Open WebUI RAG pipeline for custom document indexing.
+- **Web Search Integration**: Auto-triggers DuckDuckGo web retrieval for temporal questions, appending real-time context and citation metadata.
 
-Install system tools:
+### 5. Persistent Telemetry & Manual Evaluation
+- **Database History**: All conversation turns, latencies (STT, LLM first-token, TTS generation, and total roundtrip ms), citations, and settings are written to a local SQLite database (`.local/swarlocal.db`).
+- **Manual QA Panel**: Rate voice naturalness, pronunciation, and similarity to log model behavior in the database.
 
+---
+
+## 🛠 System Architecture
+
+```mermaid
+graph TD
+    User([User Voice/Text]) --> Frontend[React + Vite Frontend]
+    Frontend -->|WebSocket / HTTP| Backend[FastAPI Server]
+    
+    subgraph Voice Pipeline
+        Backend --> STT[Faster Whisper STT]
+        Backend --> Router[Language Router]
+        Backend --> LLM{Brain Routing}
+        LLM -->|Local| Ollama[Ollama Server]
+        LLM -->|Cloud| CloudLLM[OpenAI / Gemini]
+        Backend --> TTS{TTS Router}
+        TTS -->|Local| Piper[Piper TTS]
+        TTS -->|Zero-Shot| Chatterbox[Chatterbox TTS]
+        TTS -->|Cloud| ElevenLabs[ElevenLabs TTS]
+    end
+    
+    subgraph Data & Context
+        Backend --> SQLite[(SQLite Telemetry & Consents)]
+        Backend --> RAG[Open WebUI RAG]
+        Backend --> Web[Web Retrieval Provider]
+    end
+    
+    Backend --> Frontend
+```
+
+---
+
+## 💻 macOS Installation & Setup
+
+### Prerequisites
+- **macOS** with Apple Silicon or Intel Core
+- **Python 3.11** (recommended version)
+- **Node.js 20+** and npm
+- **ffmpeg** (required for audio conversions)
+- **Ollama** (local LLM manager)
+
+### 1. Install System Dependencies
 ```bash
 brew install ffmpeg
 ```
 
-Install Ollama from the official macOS app or install script:
-
+### 2. Install and Start Ollama
+Download and run the official app from [ollama.com](https://ollama.com) or install via terminal:
 ```bash
 curl -fsSL https://ollama.com/install.sh | sh
 ```
-
-Start Ollama and pull the default model:
-
+Start Ollama and fetch the required reasoning models:
 ```bash
-ollama pull qwen3:1.7b
+ollama pull qwen2.5:7b
+ollama pull gemma3:4b
 ```
 
-Install app dependencies:
-
+### 3. Clone and Initialize Project
+Clone the repository and prepare your environment settings:
 ```bash
 cp .env.example .env
 make setup
 ```
 
-Check your local runtime:
-
+### 4. Download Recommended Piper Voice Models
+Run the setup download script to pull Nepalese and English Piper voices into your models cache:
 ```bash
-make doctor
+make download-piper-voices
 ```
-
-`make doctor` prints `READY` only when critical local pieces are present. If it prints `BLOCKED`, follow the listed fix commands. The command exits successfully so it can be used during setup without breaking your terminal workflow.
-
-Create a voice folder and place Piper voices there:
-
-```bash
-mkdir -p models/piper
-```
-
-Recommended MVP voices:
-
-- Nepali: `ne_NP-chitwan-medium` or `ne_NP-google-medium`
-- English: `en_US-lessac-medium` or `en_US-ryan-medium`
-
-Update `.env` or the Settings screen if your filenames differ:
-
-```bash
-PIPER_NEPALI_VOICE=./models/piper/ne_NP-chitwan-medium.onnx
-PIPER_ENGLISH_VOICE=./models/piper/en_US-lessac-medium.onnx
-```
-
-Run the app:
-
-```bash
-make dev
-```
-
-Open:
-
+Your voices directory should look like this:
 ```text
-http://127.0.0.1:5173
+models/
+└── piper/
+    ├── ne_NP-chitwan-medium.onnx
+    ├── ne_NP-chitwan-medium.onnx.json
+    ├── en_US-lessac-medium.onnx
+    └── en_US-lessac-medium.onnx.json
 ```
 
-## Validation
-
+### 5. Validate the Setup (Doctor Check)
+Confirm all local dependencies, directories, and files are present and active:
 ```bash
-make test
-make lint
-npm --prefix frontend run build
 make doctor
 ```
 
-Real local runtime smoke test:
+---
 
-```bash
-make e2e
-```
+## 👨‍💻 Development Commands
 
-`make e2e` does not require a microphone. It does require Ollama, the configured model, Piper, ffmpeg, and matching `.onnx` plus `.onnx.json` voice files. If those are missing, it fails with exact reasons.
+SwarLocal uses a modular `Makefile` to handle development, testing, and formatting:
 
-Optional local zero-shot voice cloning uses Chatterbox:
+| Target Command | Description |
+| :--- | :--- |
+| `make dev` | Launches backend (Uvicorn: `8000`) and frontend (Vite: `5173`) in parallel |
+| `make test` | Runs Python unit tests and verifies SQLite database operations |
+| `make lint` | Performs backend syntax validation and typechecks the React code |
+| `make doctor` | Diagnoses local models, directories, configurations, and API paths |
+| `make e2e` | Runs an end-to-end local text-to-speech and logic smoke test |
+| `make ui-test` | Runs static layout, theme contrast, responsive design, and UX contract tests |
+| `make setup-voice-clone` | Installs system dependencies for local Chatterbox voice cloning |
+| `make clean` | Wipes build targets, testing cache files, and coverage outputs |
 
-```bash
-make setup-voice-clone
-```
+---
 
-The first Chatterbox synthesis downloads model weights into `.local/huggingface`. On macOS the app defaults Chatterbox to CPU because the MPS path can crash the backend on some Metal runtimes; set `CHATTERBOX_DEVICE=mps` only if you have verified it locally.
+## 🔌 API Documentation
 
-- `GET /health`
-- `GET /settings`
-- `POST /settings`
-- `GET /models/status`
-- `GET /doctor`
-- `GET /voices`
-- `POST /stt/test`
-- `POST /chat/test`
-- `POST /tts/test`
-- `DELETE /local-data`
-- `GET /ai-providers`
-- `GET /ai-providers/status`
-- `POST /ai-providers/test`
-- `POST /ai-providers/test/local`
-- `POST /ai-providers/test/openai`
-- `POST /ai-providers/test/gemini`
-- `POST /settings/ai-provider`
-- `DELETE /settings/openai-key`
-- `DELETE /settings/gemini-key`
-- `WS /ws/voice`
+SwarLocal exposes a FastAPI Swagger UI at `http://127.0.0.1:8000/docs`. Key routes are:
 
-## AI Provider Configuration
+### Core & Settings
+- `GET /health` - Checks backend lifecycle status.
+- `GET /settings` / `POST /settings` - Retrieves or updates active configurations.
+- `DELETE /local-data` - Cleans local temporary turn directories and clears SQLite logs.
 
-SwarLocal supports three LLM providers:
-1. **Local Ollama** (Default): Offline, private, uses `qwen2.5:7b` (fallback: `gemma3:4b`).
-2. **OpenAI**: Cloud-based, uses `gpt-4o-mini` (requires API key).
-3. **Google Gemini**: Cloud-based, uses `gemini-1.5-flash` (requires API key).
+### AI Reasoning & Providers
+- `GET /ai-providers` - Lists Ollama, OpenAI, and Gemini brains.
+- `POST /ai-providers/test/{provider}` - Validates API key and reports response latency.
+- `POST /settings/ai-provider` - Saves API key credentials in encrypted runtime profiles.
 
-Configure active providers, key masking, fallback capabilities, and connection testing on the Settings page or easily switch active providers on the Conversation page. Audio files, STT, and TTS remain entirely local; only prompt text is sent to cloud brains if selected.
+### Chat & Voice Socket
+- `POST /chat/test` - Performs a single-turn text-to-speech HTTP test.
+- `GET /chat/history` - Returns persistent conversation turns with latencies, citations, and ratings.
+- `POST /chat/turns/{turn_id}/rate` - Attaches manual Naturalness, Similarity, and Pronunciation ratings to a turn.
+- `WS /ws/voice` - Real-time audio socket handling Push-To-Talk and streaming response.
 
-## Offline Use
+### Voice Studio & Datasets
+- `GET /voices` - Inspects details on all active Piper, cloud, and cloned custom voices.
+- `POST /voices/create` - Initializes a new voice profile (Nepali, English, or Mixed).
+- `POST /voices/{voice_id}/consent` - Uploads required signature and vocal consent file.
+- `POST /voices/{voice_id}/recordings/{prompt_id}` - Uploads, cleans, and runs quality checks on vocal samples.
+- `POST /voices/{voice_id}/clone` - Compiles recorded samples and builds model configurations.
+- `POST /voices/{voice_id}/publish` - Publishes the voice to the global workspace selector.
 
-After Python packages, npm packages, Ollama models, Faster Whisper model files, and Piper voices are downloaded, normal conversation does not require internet access.
+---
 
-## Audio Handling
+## 🔒 Privacy & Boundaries
 
-Normal push-to-talk audio is treated as temporary turn data. Browser audio is validated, converted through ffmpeg to 16 kHz mono WAV for STT, then deleted unless `KEEP_TURN_AUDIO=true` is explicitly configured. Dataset recordings are separate and require the consent checkbox in the Dataset screen.
-
-## Voice Cloning Boundary
-
-This repo supports consent-based cloning for the user's own voice. Chatterbox provides local zero-shot cloning from Voice Studio recordings. Piper remains the production `.onnx` path, but real Piper fine-tuning must be supplied through `PIPER_TRAIN_COMMAND`; the app no longer pretends a copied base Piper model is a trained clone. Do not clone another person or use recordings without clear permission.
+1. **Local-First Processing**: By default, no audio clips, speech transcripts, or reasoning loops leave your macOS machine. 
+2. **Consent Requirement**: Model cloning requires an signed consent agreement. Voice profiles cannot be processed or finalized without verified signature credentials.
+3. **No Voice Spoofing**: SwarLocal does not implement workflows for cloning third-party voices without consent. All training loops are built for user-owned datasets.
+4. **Data Lifecycle**: Voice recordings, database metrics, and logs are cached under `.local/` (which is excluded from Git). You can clear all cached assets instantly in the settings tab.
