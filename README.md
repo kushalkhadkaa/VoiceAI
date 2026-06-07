@@ -6,8 +6,6 @@
 [![Python: 3.11](https://img.shields.io/badge/Python-3.11-blue.svg)](https://www.python.org/)
 [![TypeScript: 5.0](https://img.shields.io/badge/TypeScript-5.0-blue.svg)](https://www.typescriptlang.org/)
 
-![SwarLocal UI Mockup](docs/images/swarlocal_ui_mockup.png)
-
 SwarLocal is a local-first, low-latency voice AI assistant designed for macOS that seamlessly integrates **Nepali and English** speech. By combining a high-performance FastAPI backend, a premium React/Vite/TypeScript frontend, and SQLite telemetry, SwarLocal runs fully offline on your Apple Silicon or Intel MacBook. 
 
 Whether you are query-searching local files, archiving native dialects, or training consent-based voice models, SwarLocal puts you in absolute control of your data.
