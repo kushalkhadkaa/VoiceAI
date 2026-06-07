@@ -119,6 +119,44 @@ def init_db() -> None:
         details TEXT
     );
     """)
+
+    # 10. chat_turns
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS chat_turns (
+        id TEXT PRIMARY KEY,
+        session_id TEXT,
+        timestamp TEXT NOT NULL,
+        transcript TEXT NOT NULL,
+        response TEXT NOT NULL,
+        input_language TEXT NOT NULL,
+        response_language TEXT NOT NULL,
+        audio_url TEXT,
+        user_audio_url TEXT,
+        tts_route TEXT,
+        timings TEXT,
+        rag_used INTEGER DEFAULT 0,
+        rag_collection_id TEXT,
+        rag_fallback_used INTEGER DEFAULT 0,
+        internet_used INTEGER DEFAULT 0,
+        citations TEXT,
+        voice_id TEXT,
+        requested_voice_id TEXT,
+        requested_voice_name TEXT,
+        actual_voice_id TEXT,
+        actual_voice_name TEXT,
+        actual_engine TEXT,
+        actual_model_path TEXT,
+        fallback_used INTEGER DEFAULT 0,
+        fallback_reason TEXT,
+        llm_provider TEXT,
+        rag_path TEXT,
+        rating_naturalness INTEGER,
+        rating_voice_similarity INTEGER,
+        rating_nepali_pronunciation INTEGER,
+        rating_english_pronunciation INTEGER
+    );
+    """)
     
     conn.commit()
     conn.close()
+

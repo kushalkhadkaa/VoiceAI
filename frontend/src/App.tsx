@@ -70,7 +70,9 @@ import {
   testRagQuestion,
   deleteOpenAIKey,
   deleteGeminiKey,
-  deleteElevenLabsKey
+  deleteElevenLabsKey,
+  getChatHistory,
+  rateChatTurn
 } from "./api";
 import { blobToBase64, downloadBlob, scoreRecording } from "./audio";
 import type {
@@ -170,7 +172,7 @@ function App() {
   const [activeView, setActiveView] = useState<ViewId>("conversation");
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [autoVad, setAutoVad] = useLocalStorage("swarlocal.autoVad", true);
-  const [history, setHistory] = useLocalStorage<ConversationTurn[]>("swarlocal.history", []);
+  const [history, setHistory] = useState<ConversationTurn[]>([]);
   const [settings, setSettings] = useState<BackendSettings>(defaultSettings);
   const [providerStatus, setProviderStatus] = useState<ProviderStatus[]>([]);
   const [voiceSocketStatus, setVoiceSocketStatus] = useState<VoiceSocketStatus | null>(null);
@@ -181,12 +183,6 @@ function App() {
   const [lastAudioUrl, setLastAudioUrl] = useState<string | null>(null);
   const [datasetRecordings, setDatasetRecordings] = useState<DatasetRecording[]>([]);
   const [datasetActivePrompt, setDatasetActivePrompt] = useState<string | null>(null);
-  const [ratings, setRatings] = useLocalStorage<Record<string, number>>("swarlocal.eval", {
-    naturalness: 3,
-    voiceSimilarity: 3,
-    nepaliPronunciation: 3,
-    englishPronunciation: 3
-  });
 
   const [selectedVoiceId, setSelectedVoiceId] = useLocalStorage("swarlocal.selectedVoiceId", "auto");
   const [selectedKnowledgeId, setSelectedKnowledgeId] = useLocalStorage("swarlocal.selectedKnowledgeId", "none");
@@ -268,6 +264,18 @@ function App() {
     ].slice(0, 250));
   }, [setAppLogs]);
 
+  const handleRatingChange = useCallback(async (newRatings: Record<string, number>) => {
+    const latestTurn = history[0];
+    if (latestTurn && latestTurn.id) {
+      try {
+        await rateChatTurn(latestTurn.id, newRatings);
+        setHistory(prev => prev.map((turn, i) => i === 0 ? { ...turn, ratings: newRatings } : turn));
+      } catch (err: any) {
+        logEvent("error", "save_rating_failed", `Failed to save rating to SQLite: ${err.message}`);
+      }
+    }
+  }, [history, logEvent]);
+
   useEffect(() => {
     if (error) {
       logEvent("error", "ui_error", error);
@@ -289,7 +297,8 @@ function App() {
         auditPayload,
         systemPayload,
         systemInfoPayload,
-        ragStatusPayload
+        ragStatusPayload,
+        historyPayload
       ] = await Promise.all([
         getHealth().catch(() => false),
         getModelStatus().catch(() => []),
@@ -302,7 +311,8 @@ function App() {
         getAuditLogs().catch(() => []),
         getSystemMetrics().catch(() => null),
         getSystemInfo().catch(() => null),
-        getRagStatus().catch(() => null)
+        getRagStatus().catch(() => null),
+        getChatHistory().catch(() => [])
       ]);
       const allProviders = [
         { name: "browser_backend_link", ok: healthOk, detail: healthOk ? "Backend reachable" : "Backend unavailable" },
@@ -322,6 +332,7 @@ function App() {
       setSystemMetrics(systemPayload);
       setSystemInfo(systemInfoPayload);
       setRagStatus(ragStatusPayload);
+      setHistory(historyPayload);
       logEvent("success", "status_refreshed", "Runtime status, settings, voices, collections, and logs refreshed.");
     } catch (refreshError) {
       setError(refreshError instanceof Error ? refreshError.message : "Unable to refresh status.");
@@ -893,7 +904,13 @@ function App() {
           />
         );
       case "evaluation":
-        return <EvaluationView ratings={ratings} onChange={setRatings} history={history} />;
+        const currentRatings = history[0]?.ratings ?? {
+          naturalness: 3,
+          voiceSimilarity: 3,
+          nepaliPronunciation: 3,
+          englishPronunciation: 3
+        };
+        return <EvaluationView ratings={currentRatings} onChange={handleRatingChange} history={history} />;
       case "admin":
         return (
           <AdminView
@@ -965,12 +982,11 @@ function App() {
     latestTurn,
     manualText,
     providerStatus,
-    ratings,
     refreshStatus,
     settings,
     setAutoVad,
     setHistory,
-    setRatings,
+    handleRatingChange,
     status,
     voiceSocketState,
     voiceSocketStatus,

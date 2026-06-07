@@ -151,6 +151,80 @@ class ApiTest(unittest.TestCase):
         response = client.get("/dataset/recordings")
         self.assertFalse(next(r for r in response.json() if r["id"] == "000001")["exists"])
 
+    def test_chat_history_and_ratings(self) -> None:
+        client = TestClient(app)
+        
+        # 1. Insert a mock turn into SQLite database
+        from app.database import get_db_connection
+        conn = get_db_connection()
+        turn_id = "test-turn-123"
+        try:
+            conn.execute("DELETE FROM chat_turns WHERE id = ?;", (turn_id,))
+            conn.execute(
+                """
+                INSERT INTO chat_turns (
+                    id, session_id, timestamp, transcript, response, input_language, response_language,
+                    audio_url, user_audio_url, tts_route, timings, rag_used, rag_collection_id,
+                    rag_fallback_used, internet_used, citations, voice_id, requested_voice_id,
+                    requested_voice_name, actual_voice_id, actual_voice_name, actual_engine,
+                    actual_model_path, fallback_used, fallback_reason, llm_provider, rag_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    turn_id, "test-session", "2026-06-07T22:00:00Z", "hello", "hi there", "en", "en",
+                    "/audio/test.wav", None, "[]", "{}", 0, None, 0, 0, "[]", "test_voice", "test_voice",
+                    "Test Voice", "test_voice", "Test Voice", "piper", "path/to/model", 0, None, "local", None
+                )
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        try:
+            # 2. Get history and check if the inserted turn is in the list
+            response = client.get("/chat/history")
+            self.assertEqual(response.status_code, 200)
+            history = response.json()
+            turn = next((item for item in history if item["id"] == turn_id), None)
+            self.assertIsNotNone(turn)
+            self.assertEqual(turn["transcript"], "hello")
+            self.assertEqual(turn["response"], "hi there")
+            self.assertEqual(turn["ratings"], {}) # No ratings yet
+
+            # 3. Update the rating via POST endpoint
+            rating_payload = {
+                "naturalness": 5,
+                "voice_similarity": 4,
+                "nepali_pronunciation": 3,
+                "english_pronunciation": 4
+            }
+            rate_response = client.post(f"/chat/turns/{turn_id}/rate", json=rating_payload)
+            self.assertEqual(rate_response.status_code, 200)
+            self.assertTrue(rate_response.json()["ok"])
+
+            # 4. Get history again and verify ratings are updated
+            response2 = client.get("/chat/history")
+            history2 = response2.json()
+            turn2 = next((item for item in history2 if item["id"] == turn_id), None)
+            self.assertIsNotNone(turn2)
+            self.assertEqual(turn2["ratings"]["naturalness"], 5)
+            self.assertEqual(turn2["ratings"]["voiceSimilarity"], 4)
+            self.assertEqual(turn2["ratings"]["nepaliPronunciation"], 3)
+            self.assertEqual(turn2["ratings"]["englishPronunciation"], 4)
+            
+            # 5. Rate with a non-existent turn_id and verify 404
+            rate_404_res = client.post("/chat/turns/nonexistent-id/rate", json=rating_payload)
+            self.assertEqual(rate_404_res.status_code, 404)
+        finally:
+            # Cleanup
+            conn = get_db_connection()
+            try:
+                conn.execute("DELETE FROM chat_turns WHERE id = ?;", (turn_id,))
+                conn.commit()
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()
+

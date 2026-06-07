@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +42,7 @@ class ConversationService:
         knowledge_id: str | None = None,
         use_internet: bool = False,
         llm_provider_id: str | None = None,
+        session_id: str | None = None,
     ) -> ConversationResponse:
         started = time.perf_counter()
         stt_result = self.stt_provider.transcribe_file(audio_path)
@@ -55,6 +57,7 @@ class ConversationService:
             knowledge_id=knowledge_id,
             use_internet=use_internet,
             llm_provider_id=llm_provider_id,
+            session_id=session_id,
         )
 
     def handle_text(
@@ -64,6 +67,7 @@ class ConversationService:
         knowledge_id: str | None = None,
         use_internet: bool = False,
         llm_provider_id: str | None = None,
+        session_id: str | None = None,
     ) -> ConversationResponse:
         started = time.perf_counter()
         return self._complete_turn(
@@ -74,6 +78,7 @@ class ConversationService:
             knowledge_id=knowledge_id,
             use_internet=use_internet,
             llm_provider_id=llm_provider_id,
+            session_id=session_id,
         )
 
     def _instantiate_provider(self, provider_id: str) -> Any:
@@ -120,6 +125,7 @@ class ConversationService:
         knowledge_id: str | None = None,
         use_internet: bool = False,
         llm_provider_id: str | None = None,
+        session_id: str | None = None,
     ) -> ConversationResponse:
         input_language = self.language_router.detect(text, whisper_language, whisper_confidence)
         
@@ -279,7 +285,9 @@ class ConversationService:
         # Record usage event
         self._record_usage_event(audio_sidecar)
 
-        return ConversationResponse(
+        turn_id = str(uuid.uuid4())
+        response_obj = ConversationResponse(
+            id=turn_id,
             transcript=text,
             response=llm_result.text,
             input_language=input_language.language,
@@ -314,6 +322,63 @@ class ConversationService:
             llm_provider=actual_provider,
             rag_path=rag_path,
         )
+
+        self._save_chat_turn(response_obj, session_id)
+        return response_obj
+
+    def _save_chat_turn(self, turn: ConversationResponse, session_id: str | None) -> None:
+        from app.database import get_db_connection
+        import json
+        import time
+        conn = get_db_connection()
+        try:
+            timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            conn.execute(
+                """
+                INSERT INTO chat_turns (
+                    id, session_id, timestamp, transcript, response, input_language, response_language,
+                    audio_url, user_audio_url, tts_route, timings, rag_used, rag_collection_id,
+                    rag_fallback_used, internet_used, citations, voice_id, requested_voice_id,
+                    requested_voice_name, actual_voice_id, actual_voice_name, actual_engine,
+                    actual_model_path, fallback_used, fallback_reason, llm_provider, rag_path
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                (
+                    turn.id,
+                    session_id,
+                    timestamp,
+                    turn.transcript,
+                    turn.response,
+                    turn.input_language,
+                    turn.response_language,
+                    turn.audio_url,
+                    None,
+                    json.dumps(turn.tts_route),
+                    json.dumps(turn.timings.model_dump()),
+                    1 if turn.rag_used else 0,
+                    turn.rag_collection_id,
+                    1 if turn.rag_fallback_used else 0,
+                    1 if turn.internet_used else 0,
+                    json.dumps(turn.citations or []),
+                    turn.voice_id,
+                    turn.requested_voice_id,
+                    turn.requested_voice_name,
+                    turn.actual_voice_id,
+                    turn.actual_voice_name,
+                    turn.actual_engine,
+                    turn.actual_model_path,
+                    1 if turn.fallback_used else 0,
+                    turn.fallback_reason,
+                    turn.llm_provider,
+                    turn.rag_path
+                )
+            )
+            conn.commit()
+        except Exception as e:
+            import sys
+            print(f"Error saving chat turn: {e}", file=sys.stderr)
+        finally:
+            conn.close()
 
     def _record_usage_event(self, sidecar: dict[str, Any]) -> None:
         from app.database import get_db_connection

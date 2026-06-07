@@ -438,3 +438,43 @@ export async function deleteElevenLabsKey(): Promise<BackendSettings> {
   const payload = await response.json();
   return payload.settings;
 }
+
+export async function getChatHistory(limit = 50): Promise<ConversationTurn[]> {
+  const response = await fetch(`${API_HTTP}/chat/history?limit=${limit}`);
+  if (!response.ok) {
+    throw new Error("Unable to load chat history.");
+  }
+  const payload = await response.json();
+  // Ensure audio urls are absolute
+  return payload.map((turn: any) => ({
+    ...turn,
+    audio_url: absoluteAudioUrl(turn.audio_url)
+  }));
+}
+
+export async function rateChatTurn(
+  turnId: string,
+  ratings: {
+    naturalness?: number;
+    voiceSimilarity?: number;
+    nepaliPronunciation?: number;
+    englishPronunciation?: number;
+  }
+): Promise<void> {
+  // Map camelCase to snake_case for the backend
+  const payload = {
+    naturalness: ratings.naturalness,
+    voice_similarity: ratings.voiceSimilarity,
+    nepali_pronunciation: ratings.nepaliPronunciation,
+    english_pronunciation: ratings.englishPronunciation
+  };
+  const response = await fetch(`${API_HTTP}/chat/turns/${turnId}/rate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+  if (!response.ok) {
+    throw new Error("Unable to save rating.");
+  }
+}
+

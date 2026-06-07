@@ -95,6 +95,7 @@ class TimingMetrics(BaseModel):
 
 
 class ConversationResponse(BaseModel):
+    id: str
     transcript: str
     response: str
     input_language: LanguageCode
@@ -119,6 +120,15 @@ class ConversationResponse(BaseModel):
     audio_sidecar: dict | None = None
     llm_provider: str | None = None
     rag_path: str | None = None
+    ratings: dict | None = None
+
+
+class RatingRequest(BaseModel):
+    naturalness: int | None = None
+    voice_similarity: int | None = None
+    nepali_pronunciation: int | None = None
+    english_pronunciation: int | None = None
+
 
 
 class TtsTestResponse(BaseModel):

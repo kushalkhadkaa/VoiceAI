@@ -31,6 +31,7 @@ from app.schemas import (
     VoicesResponse,
     DatasetQualityResponse,
     DatasetRecordingResponse,
+    RatingRequest,
 )
 from app.services.audio_validation import AudioPipeline, AudioValidationError, AudioValidator
 from app.services.conversation import ConversationService
@@ -594,6 +595,114 @@ def chat_test(payload: ChatTestRequest):
     )
 
 
+@app.get("/chat/history")
+def get_chat_history(limit: int = 50):
+    from app.database import get_db_connection
+    import json
+    conn = get_db_connection()
+    try:
+        rows = conn.execute(
+            """
+            SELECT * FROM chat_turns
+            ORDER BY timestamp DESC
+            LIMIT ?;
+            """,
+            (limit,)
+        ).fetchall()
+        
+        history = []
+        for r in rows:
+            try:
+                tts_route = json.loads(r["tts_route"]) if r["tts_route"] else []
+            except Exception:
+                tts_route = []
+                
+            try:
+                timings = json.loads(r["timings"]) if r["timings"] else {}
+            except Exception:
+                timings = {}
+                
+            try:
+                citations = json.loads(r["citations"]) if r["citations"] else []
+            except Exception:
+                citations = []
+                
+            ratings = {}
+            if r["rating_naturalness"] is not None:
+                ratings["naturalness"] = r["rating_naturalness"]
+            if r["rating_voice_similarity"] is not None:
+                ratings["voiceSimilarity"] = r["rating_voice_similarity"]
+            if r["rating_nepali_pronunciation"] is not None:
+                ratings["nepaliPronunciation"] = r["rating_nepali_pronunciation"]
+            if r["rating_english_pronunciation"] is not None:
+                ratings["englishPronunciation"] = r["rating_english_pronunciation"]
+
+            history.append({
+                "id": r["id"],
+                "transcript": r["transcript"],
+                "response": r["response"],
+                "input_language": r["input_language"],
+                "response_language": r["response_language"],
+                "audio_url": r["audio_url"],
+                "tts_route": tts_route,
+                "timings": timings,
+                "rag_used": bool(r["rag_used"]),
+                "rag_collection_id": r["rag_collection_id"],
+                "rag_fallback_used": bool(r["rag_fallback_used"]),
+                "internet_used": bool(r["internet_used"]),
+                "citations": citations,
+                "voice_id": r["voice_id"],
+                "requested_voice_id": r["requested_voice_id"],
+                "requested_voice_name": r["requested_voice_name"],
+                "actual_voice_id": r["actual_voice_id"],
+                "actual_voice_name": r["actual_voice_name"],
+                "actual_engine": r["actual_engine"],
+                "actual_model_path": r["actual_model_path"],
+                "fallback_used": bool(r["fallback_used"]),
+                "fallback_reason": r["fallback_reason"],
+                "llm_provider": r["llm_provider"],
+                "rag_path": r["rag_path"],
+                "ratings": ratings,
+                "created_at": r["timestamp"]
+            })
+        return history
+    finally:
+        conn.close()
+
+
+@app.post("/chat/turns/{turn_id}/rate")
+def rate_chat_turn(turn_id: str, ratings: RatingRequest):
+    from app.database import get_db_connection
+    from fastapi import HTTPException
+    conn = get_db_connection()
+    try:
+        turn = conn.execute("SELECT id FROM chat_turns WHERE id = ?;", (turn_id,)).fetchone()
+        if not turn:
+            raise HTTPException(status_code=404, detail="Chat turn not found")
+        
+        conn.execute(
+            """
+            UPDATE chat_turns
+            SET rating_naturalness = ?,
+                rating_voice_similarity = ?,
+                rating_nepali_pronunciation = ?,
+                rating_english_pronunciation = ?
+            WHERE id = ?;
+            """,
+            (
+                ratings.naturalness,
+                ratings.voice_similarity,
+                ratings.nepali_pronunciation,
+                ratings.english_pronunciation,
+                turn_id
+            )
+        )
+        conn.commit()
+        return {"ok": True}
+    finally:
+        conn.close()
+
+
 @app.post("/tts/test", response_model=TtsTestResponse)
 def tts_test(payload: TtsTestRequest) -> TtsTestResponse:
     language = payload.language or language_router.detect(payload.text).language
@@ -638,6 +747,19 @@ def delete_local_data():
     if metadata_path.exists():
         metadata_path.unlink()
         deleted.append(str(metadata_path))
+        
+    # Clear SQLite database tables for chat turns & events
+    from app.database import get_db_connection
+    conn = get_db_connection()
+    try:
+        conn.execute("DELETE FROM chat_turns;")
+        conn.execute("DELETE FROM voice_usage_events;")
+        conn.commit()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+        
     return {"deleted": deleted}
 
 
@@ -766,6 +888,7 @@ async def voice_socket(websocket: WebSocket):
                         knowledge_id=session_knowledge_id,
                         use_internet=session_use_internet,
                         llm_provider_id=session_llm_provider_id,
+                        session_id=socket_status.get("session_id"),
                     )
                 elif message_type == "audio":
                     if not socket_status["capabilities"].get("audio_turns"):
@@ -794,6 +917,7 @@ async def voice_socket(websocket: WebSocket):
                             knowledge_id=session_knowledge_id,
                             use_internet=session_use_internet,
                             llm_provider_id=session_llm_provider_id,
+                            session_id=socket_status.get("session_id"),
                         )
                     finally:
                         audio_pipeline.cleanup_turn_audio(audio_path)

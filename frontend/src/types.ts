@@ -14,6 +14,7 @@ export interface TimingMetrics {
 }
 
 export interface ConversationTurn {
+  id?: string;
   transcript: string;
   response: string;
   input_language: LanguageCode;
@@ -23,6 +24,7 @@ export interface ConversationTurn {
   tts_route?: Array<{ text: string; language: LanguageCode }>;
   timings: TimingMetrics;
   created_at?: string;
+  ratings?: Record<string, number>;
   
   // Custom upgrade fields
   rag_used?: boolean | null;
