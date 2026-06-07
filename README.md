@@ -40,8 +40,6 @@ A clean, consent-based environment for custom voice profiling:
 
 ## 🛠 System Architecture & Data Flow
 
-![SwarLocal Architecture Diagram](docs/images/swarlocal_architecture.png)
-
 ```mermaid
 flowchart TB
     %% User Inputs
