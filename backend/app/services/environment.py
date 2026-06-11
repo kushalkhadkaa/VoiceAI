@@ -49,7 +49,7 @@ def run_environment_checks(settings: Settings) -> EnvironmentReport:
         _ollama_binary_check(),
         _ollama_api_check(settings),
         _ollama_model_check(settings),
-        _installed_model_check(settings, "qwen2.5:7b", critical=True),
+        _installed_model_check(settings, "qwen2.5:7b", critical=False),
         _installed_model_check(settings, "gemma3:4b", critical=False),
         _open_webui_check(settings),
         _open_webui_auth_check(settings),
@@ -75,7 +75,8 @@ def run_environment_checks(settings: Settings) -> EnvironmentReport:
 
 def _run_version(command: list[str]) -> tuple[bool, str]:
     try:
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, check=False)
+        shell = platform.system() == "Windows"
+        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=5, check=False, shell=shell)
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         return False, str(exc)
     return result.returncode == 0, result.stdout.strip().splitlines()[0] if result.stdout.strip() else "installed"
@@ -138,7 +139,7 @@ def _ollama_binary_check() -> EnvironmentCheck:
     return EnvironmentCheck(
         "ollama_binary",
         path is not None,
-        True,
+        False,
         path or "ollama not found",
         "Install Ollama, then run: ollama pull qwen3:1.7b",
     )

@@ -5,6 +5,9 @@ import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def _bool_env(name: str, default: bool) -> bool:
