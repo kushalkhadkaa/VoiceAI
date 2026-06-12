@@ -11,17 +11,16 @@ from app.services.environment import run_environment_checks
 
 
 CHECK_BLOCKERS = {
-    "ffmpeg": "ffmpeg missing",
+    # ffmpeg removed — Piper TTS + Whisper STT work without ffmpeg; it's only needed for
+    # audio format conversion in Voice Studio. Voice chat is fully functional without it.
     "ollama_api": "Ollama unavailable",
     "ollama_model": "selected Ollama model missing",
     "piper": "Piper unavailable",
     "piper_nepali_voice": "Piper voice missing",
     "piper_english_voice": "Piper voice missing",
     "stt": "STT unavailable",
-    "open_webui": "Open WebUI unavailable",
-    "open_webui_auth": "Open WebUI API key missing",
-    "openai_configured": "OpenAI API key missing",
-    "gemini_configured": "Gemini API key missing",
+    # open_webui / open_webui_auth removed — Open WebUI is optional (RAG only)
+    # openai_configured / gemini_configured removed — cloud providers are optional
     "active_provider_ready": "selected active provider unavailable",
 }
 
@@ -102,9 +101,10 @@ def build_voice_socket_status(settings: Settings) -> dict[str, Any]:
         "backend": True,
         "websocket": True,
         "text_turns": llm_ready,
+        # audio_turns: ffmpeg is NOT required — Piper+Whisper handle voice natively
         "audio_turns": all(
             _check_ok(check_map, name)
-            for name in ("ffmpeg", "piper", "piper_nepali_voice", "piper_english_voice", "stt")
+            for name in ("piper", "piper_nepali_voice", "piper_english_voice", "stt")
         ) and llm_ready,
         "stt": _check_ok(check_map, "stt"),
         "tts": _check_ok(check_map, "piper") and _check_ok(check_map, "piper_nepali_voice") and _check_ok(check_map, "piper_english_voice"),

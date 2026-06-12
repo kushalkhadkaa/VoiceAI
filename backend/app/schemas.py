@@ -24,6 +24,7 @@ class SettingsUpdateRequest(BaseModel):
     ollama_num_predict: int | None = None
     ollama_keep_alive: str | None = None
     system_prompt: str | None = None
+    bank_instruction: str | None = None
     whisper_model_size: str | None = None
     piper_nepali_voice: str | None = None
     piper_english_voice: str | None = None
@@ -36,11 +37,27 @@ class SettingsUpdateRequest(BaseModel):
     rag_enabled: bool | None = None
     rag_default_collection: str | None = None
     rag_fallback_to_ollama: bool | None = None
+    rag_mode: str | None = None
+    kb_chromadb_path: str | None = None
+    kb_embedding_provider: str | None = None
+    kb_embedding_model: str | None = None
+    kb_embedding_model_st: str | None = None
+    kb_chunk_size: int | None = None
+    kb_chunk_overlap: int | None = None
+    kb_max_results: int | None = None
+    kb_similarity_threshold: float | None = None
+    kb_search_mode: str | None = None
+    kb_chunk_strategy: str | None = None
+    kb_reranking_enabled: bool | None = None
+    kb_reranking_model: str | None = None
+    kb_query_analytics: bool | None = None
     internet_retrieval_enabled: bool | None = None
     internet_max_sources: int | None = None
     internet_require_citation: bool | None = None
     internet_fallback_allowed: bool | None = None
     llm_provider: str | None = None
+    stt_provider: str | None = None
+    tts_provider: str | None = None
     local_model: str | None = None
     local_fallback_model: str | None = None
     openai_api_key: str | None = None
@@ -55,6 +72,7 @@ class SettingsUpdateRequest(BaseModel):
     force_selected_voice: bool | None = None
     fallback_allowed: bool | None = None
     single_tts_voice_model: bool | None = None
+    openai_tts_voice: str | None = None
 
 
 class ProviderStatus(BaseModel):
@@ -76,6 +94,8 @@ class ChatTestRequest(BaseModel):
     knowledge_id: str | None = None
     use_internet: bool = False
     llm_provider_id: str | None = None
+    stt_provider_id: str | None = None
+
 
 
 class TtsTestRequest(BaseModel):
@@ -98,8 +118,11 @@ class ConversationResponse(BaseModel):
     id: str
     transcript: str
     response: str
+    transcript_translation: str | None = None
+    response_translation: str | None = None
     input_language: LanguageCode
     response_language: LanguageCode
+
     audio_url: str | None = None
     tts_route: list[dict] = []
     timings: TimingMetrics

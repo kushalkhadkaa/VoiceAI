@@ -137,7 +137,7 @@ class CommercialFeaturesTest(unittest.TestCase):
         from app.config import Settings
         
         # 1. When rag_enabled is False
-        settings_test = Settings(rag_enabled=False, open_webui_api_key="")
+        settings_test = Settings(rag_enabled=False, open_webui_api_key="", llm_provider="local")
         status = build_voice_socket_status(settings_test)
         self.assertNotIn("Open WebUI API key missing", status["blocking_reasons"])
         self.assertNotIn("Open WebUI unavailable", status["blocking_reasons"])
@@ -148,6 +148,7 @@ class CommercialFeaturesTest(unittest.TestCase):
             open_webui_api_key="",
             rag_default_collection="",
             ollama_model=settings.ollama_model,
+            llm_provider="local",
         )
         status_2 = build_voice_socket_status(settings_test_2)
         self.assertNotIn("Open WebUI API key missing", status_2["blocking_reasons"])
@@ -543,7 +544,7 @@ class CommercialFeaturesTest(unittest.TestCase):
         # Try to publish with no recordings (should fail with 400)
         resp = client.post(f"/voices/{voice_id}/publish")
         self.assertEqual(resp.status_code, 400)
-        self.assertIn("at least 3 clean recordings", resp.json()["detail"].lower())
+        self.assertIn("at least 3 usable recordings", resp.json()["detail"].lower())
         
         # 3. Add 3 samples via direct SQL (to simulate mock inserts)
         conn = get_db_connection()

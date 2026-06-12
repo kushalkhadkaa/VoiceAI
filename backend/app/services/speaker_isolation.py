@@ -73,20 +73,20 @@ class SpeakerIsolationService:
                 mean_env = sum(envelopes) / len(envelopes)
                 variance = sum((e - mean_env)**2 for e in envelopes) / len(envelopes)
                 
-                if similarity < 0.65:
+                if similarity < 0.45:
                     multiple_speakers = True
                     reasons.append("This does not sound like the selected owner")
-                elif similarity < 0.80:
+                elif similarity < 0.60:
                     background_speech = True
-                    reasons.append("Background speech detected")
-                
-                if variance > 0.08:
+                    reasons.append("Background noise detected — try a quieter place")
+
+                if variance > 0.15:
                     multiple_speakers = True
                     reasons.append("Multiple voices detected")
         except Exception:
             pass
 
-        matched = similarity >= 0.78 and not multiple_speakers
+        matched = similarity >= 0.50 and not multiple_speakers
         if matched:
             reason = "Speaker verified"
         else:

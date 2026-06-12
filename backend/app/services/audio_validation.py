@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import platform
 import shutil
 import subprocess
 import time
@@ -32,6 +33,58 @@ class AudioValidationResult:
     mime_type: str
     duration_seconds: float | None
     size_bytes: int
+
+
+def _find_ffmpeg_binary() -> str | None:
+    """
+    Locate ffmpeg in this priority order:
+      1. System PATH
+      2. Common Windows installation directories
+      3. static-ffmpeg bundled binary (auto-downloaded once, then cached)
+    Returns the full path string, or None if completely unavailable.
+    """
+    # 1. System PATH
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+
+    # 2. Common Windows paths
+    if platform.system() == "Windows":
+        candidates = [
+            Path(r"C:\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\Program Files\ffmpeg\bin\ffmpeg.exe"),
+            Path(r"C:\ProgramData\chocolatey\bin\ffmpeg.exe"),
+            Path(r"C:\tools\ffmpeg\bin\ffmpeg.exe"),
+            Path.home() / "scoop" / "apps" / "ffmpeg" / "current" / "bin" / "ffmpeg.exe",
+        ]
+        for c in candidates:
+            if c.exists():
+                return str(c)
+
+    # 3. static-ffmpeg bundled binary (no system install required)
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()  # downloads ~100 MB once, then cached permanently
+        found = shutil.which("ffmpeg")
+        if found:
+            return found
+    except Exception:
+        pass
+
+    return None
+
+
+# Cache the resolved path so we only search once per process lifetime
+_FFMPEG_PATH: str | None = None
+_FFMPEG_RESOLVED = False
+
+
+def get_ffmpeg_path() -> str | None:
+    global _FFMPEG_PATH, _FFMPEG_RESOLVED
+    if not _FFMPEG_RESOLVED:
+        _FFMPEG_PATH = _find_ffmpeg_binary()
+        _FFMPEG_RESOLVED = True
+    return _FFMPEG_PATH
 
 
 class AudioValidator:
@@ -76,10 +129,7 @@ class AudioPipeline:
         wav_path = self.work_dir / f"turn-{token}.16k.wav"
         input_path.write_bytes(audio_bytes)
         try:
-            if input_suffix == ".wav":
-                self._convert_to_wav(input_path, wav_path)
-            else:
-                self._convert_to_wav(input_path, wav_path)
+            self._convert_to_wav(input_path, wav_path)
             self.validator.validate_wav_duration(wav_path)
         finally:
             if not self.keep_turn_audio:
@@ -91,25 +141,31 @@ class AudioPipeline:
             path.unlink(missing_ok=True)
 
     def _convert_to_wav(self, input_path: Path, output_path: Path) -> None:
-        if shutil.which("ffmpeg") is None:
-            raise ProviderUnavailableError("ffmpeg is required to decode browser audio. Run: brew install ffmpeg")
+        ffmpeg = get_ffmpeg_path()
+        if ffmpeg is None:
+            raise ProviderUnavailableError(
+                "ffmpeg is not available. On Windows run: winget install ffmpeg  "
+                "OR install via chocolatey: choco install ffmpeg  "
+                "OR download from https://github.com/BtbN/FFmpeg-Builds/releases"
+            )
         command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(input_path),
-            "-ac",
-            "1",
-            "-ar",
-            "16000",
-            "-sample_fmt",
-            "s16",
+            ffmpeg, "-y", "-i", str(input_path),
+            "-ac", "1", "-ar", "16000", "-sample_fmt", "s16",
             str(output_path),
         ]
         try:
-            subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, timeout=30)
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+                timeout=30,
+                shell=(platform.system() == "Windows"),
+            )
+        except subprocess.CalledProcessError as exc:
             raise AudioValidationError("Unable to decode audio. Use webm/opus, wav, mp3, m4a, or mp4 audio.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise AudioValidationError("Audio decoding timed out.") from exc
 
 
 def _suffix_for_mime(mime_type: str | None) -> str:

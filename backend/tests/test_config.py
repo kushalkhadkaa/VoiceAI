@@ -21,7 +21,7 @@ class ConfigTest(unittest.TestCase):
                     "RUNTIME_SETTINGS_PATH": str(runtime),
                 },
                 clear=False,
-            ):
+            ), patch("app.db_settings.load_settings", return_value={}):
                 settings = Settings.from_env()
                 self.assertEqual(settings.ollama_model, "llama3.2:1b")
                 self.assertEqual(settings.max_recording_seconds, 12)

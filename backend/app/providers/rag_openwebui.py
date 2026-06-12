@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+import logging
 import json
 import urllib.error
 import urllib.request
@@ -7,17 +6,27 @@ from typing import Any
 
 from app.config import Settings
 
+logger = logging.getLogger(__name__)
+
 
 class OpenWebUIRagProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
 
     def status(self) -> dict[str, Any]:
-        config = self._get_json("/api/config", require_key=False)
+        try:
+            config = self._get_json("/api/config", require_key=False)
+            ok = bool(config.get("status"))
+            version = config.get("version")
+        except Exception as exc:
+            logger.warning("Failed to fetch Open WebUI RAG status: %s", exc)
+            ok = False
+            version = None
+
         return {
-            "ok": bool(config.get("status")),
+            "ok": ok,
             "base_url": self.settings.open_webui_base_url,
-            "version": config.get("version"),
+            "version": version,
             "api_key_configured": bool(self.settings.open_webui_api_key),
             "enabled": self.settings.rag_enabled,
             "default_collection": self.settings.rag_default_collection,

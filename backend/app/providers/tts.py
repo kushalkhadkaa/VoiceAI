@@ -385,7 +385,9 @@ class OpenAITTSProvider:
         segment_paths: list[Path] = []
         import urllib.request
         import urllib.error
-        import json
+        import socket
+        import ssl
+        import http.client
         
         for index, part in enumerate(normalized):
             segment_path = self.audio_cache_dir / f"{cache_key}.{index}.wav"
@@ -398,26 +400,54 @@ class OpenAITTSProvider:
             }
             
             url = "https://api.openai.com/v1/audio/speech"
-            request = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {self.api_key}",
-                },
-                method="POST"
-            )
+            max_retries = 3
+            last_exc = None
+            audio_bytes = None
             
+            for attempt in range(max_retries):
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {self.api_key}",
+                    },
+                    method="POST"
+                )
+                try:
+                    timeout = self.timeout_seconds * (1.5 ** attempt)
+                    with urllib.request.urlopen(request, timeout=timeout) as response:
+                        audio_bytes = response.read()
+                    break  # Success!
+                except urllib.error.HTTPError as exc:
+                    last_exc = exc
+                    # Retry on 408 Timeout, 429 Too Many Requests, or 5xx server errors
+                    if exc.code in (408, 429) or exc.code >= 500:
+                        if attempt < max_retries - 1:
+                            time.sleep(0.5 * (attempt + 1))
+                            continue
+                    break
+                except (urllib.error.URLError, TimeoutError, socket.timeout, ssl.SSLError, ConnectionError, http.client.HTTPException) as exc:
+                    last_exc = exc
+                    if attempt < max_retries - 1:
+                        time.sleep(0.5 * (attempt + 1))
+                        continue
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    break
+            
+            if audio_bytes is None:
+                if last_exc and isinstance(last_exc, urllib.error.HTTPError):
+                    err_body = last_exc.read().decode("utf-8", errors="ignore")
+                    raise RuntimeError(f"OpenAI Speech API error ({last_exc.code}): {err_body}") from last_exc
+                raise RuntimeError(f"OpenAI Speech connection error: {last_exc}") from last_exc
+                
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                    audio_bytes = response.read()
                 segment_path.write_bytes(audio_bytes)
                 segment_paths.append(segment_path)
-            except urllib.error.HTTPError as exc:
-                err_body = exc.read().decode("utf-8", errors="ignore")
-                raise RuntimeError(f"OpenAI Speech API error ({exc.code}): {err_body}") from exc
             except Exception as exc:
-                raise RuntimeError(f"OpenAI Speech connection error: {exc}") from exc
+                raise exc
 
         if len(segment_paths) == 1:
             segment_paths[0].replace(output_path)
@@ -704,9 +734,20 @@ class ChatterboxTTSProvider:
             ) from exc
 
         device = self._device(torch)
+        exaggeration = getattr(self.settings, "chatterbox_exaggeration", 0.5)
+        cfg_weight = getattr(self.settings, "chatterbox_cfg_weight", 0.5)
+        temperature = getattr(self.settings, "chatterbox_temperature", 0.8)
+        repetition_penalty = getattr(self.settings, "chatterbox_repetition_penalty", 1.2)
+
         try:
             model, language_id = self._model_for_language(part.language, device)
-            kwargs: dict[str, Any] = {"audio_prompt_path": str(reference_path)}
+            kwargs: dict[str, Any] = {
+                "audio_prompt_path": str(reference_path),
+                "exaggeration": exaggeration,
+                "cfg_weight": cfg_weight,
+                "temperature": temperature,
+                "repetition_penalty": repetition_penalty,
+            }
             if language_id is not None:
                 kwargs["language_id"] = language_id
             wav = model.generate(part.text.strip(), **kwargs)
@@ -719,7 +760,13 @@ class ChatterboxTTSProvider:
                 self._models.pop(("mtl", device), None)
                 try:
                     model, language_id = self._model_for_language(part.language, "cpu")
-                    kwargs = {"audio_prompt_path": str(reference_path)}
+                    kwargs = {
+                        "audio_prompt_path": str(reference_path),
+                        "exaggeration": exaggeration,
+                        "cfg_weight": cfg_weight,
+                        "temperature": temperature,
+                        "repetition_penalty": repetition_penalty,
+                    }
                     if language_id is not None:
                         kwargs["language_id"] = language_id
                     wav = model.generate(part.text.strip(), **kwargs)
@@ -816,6 +863,10 @@ class ChatterboxTTSProvider:
         h.update(voice_id.encode("utf-8"))
         h.update(str(reference_path).encode("utf-8"))
         h.update(str(reference_path.stat().st_mtime).encode("utf-8"))
+        h.update(str(getattr(self.settings, "chatterbox_exaggeration", 0.5)).encode("utf-8"))
+        h.update(str(getattr(self.settings, "chatterbox_cfg_weight", 0.5)).encode("utf-8"))
+        h.update(str(getattr(self.settings, "chatterbox_temperature", 0.8)).encode("utf-8"))
+        h.update(str(getattr(self.settings, "chatterbox_repetition_penalty", 1.2)).encode("utf-8"))
         manifest_path = reference_path.with_name("chatterbox_manifest.json")
         if manifest_path.exists():
             h.update(manifest_path.read_bytes())

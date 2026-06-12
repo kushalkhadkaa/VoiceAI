@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
+import shutil
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, Response, BackgroundTasks, Form
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -13,6 +16,7 @@ from app import __version__
 from app.config import Settings
 from app.providers.llm_ollama import OllamaLLMProvider
 from app.providers.rag_openwebui import OpenWebUIRagProvider
+from app.providers.embeddings import get_embedding_provider
 from app.providers.stt import FasterWhisperSTTProvider, ProviderUnavailableError
 from app.providers.tts import PiperTTSProvider, TTSPart
 from app.providers.web_retrieval import WebRetrievalProvider
@@ -53,11 +57,8 @@ from app.services.voice_clone import VoiceCloneError, VoiceCloneService
 
 settings = Settings.from_env()
 language_router = LanguageRouter()
-stt_provider = FasterWhisperSTTProvider(
-    settings.whisper_model_size,
-    device=settings.whisper_device,
-    compute_type=settings.whisper_compute_type,
-)
+from app.providers.stt import STTRouter
+stt_provider = STTRouter(settings)
 llm_provider = OllamaLLMProvider(
     settings.ollama_base_url,
     settings.ollama_model,
@@ -126,6 +127,11 @@ web_retrieval_provider = WebRetrievalProvider(
     settings.internet_fallback_allowed,
 )
 
+from app.services.kyc_service import KYCService
+from app.services import admin_auth
+
+kyc_service = KYCService(settings)
+
 conversation_service = ConversationService(
     stt_provider,
     llm_provider,
@@ -133,10 +139,84 @@ conversation_service = ConversationService(
     tts_provider,
     language_router,
     web_retrieval_provider,
+    kb_service=None,  # set after kb_service is created below
 )
 from app.services.dataset import DatasetService
 
 rag_provider = OpenWebUIRagProvider(settings)
+
+# Local KB (ChromaDB + Ollama/sentence-transformers embeddings)
+from app.services.rag_service import RAGService
+def _embedding_model_for(provider: str) -> str:
+    """Pick the model name to hand the embedding factory for a given provider.
+
+    For "auto" we pass an empty string so the factory's OpenAI-first / local
+    fallback policy chooses the correct default model itself.
+    """
+    if provider == "ollama":
+        return settings.kb_embedding_model
+    if provider == "openai":
+        return "text-embedding-3-small"
+    if provider == "sentence-transformers":
+        return settings.kb_embedding_model_st
+    return ""  # auto
+
+
+_kb_embedding = get_embedding_provider(
+    settings.kb_embedding_provider,
+    settings.ollama_base_url,
+    _embedding_model_for(settings.kb_embedding_provider),
+    openai_api_key=settings.openai_api_key,
+    timeout_seconds=settings.cloud_timeout_seconds,
+)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _collection_meta_has_docs(path: Path) -> bool:
+    meta_path = path / "collections_meta.json"
+    if not meta_path.exists():
+        return False
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return any(bool(item.get("documents")) for item in payload.values()) if isinstance(payload, dict) else False
+
+
+def _resolve_kb_db_path(raw_path: str) -> Path:
+    path = Path(raw_path)
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+
+    legacy_path = Path(__file__).resolve().parents[1] / raw_path
+    if (
+        not _collection_meta_has_docs(path)
+        and legacy_path.exists()
+        and _collection_meta_has_docs(legacy_path)
+        and path.resolve() != legacy_path.resolve()
+    ):
+        path.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(legacy_path, path, dirs_exist_ok=True)
+    return path
+
+
+_kb_db_path = _resolve_kb_db_path(settings.kb_chromadb_path)
+kb_service = RAGService(
+    db_path=str(_kb_db_path),
+    embedding_provider=_kb_embedding,
+    chunk_size=settings.kb_chunk_size,
+    chunk_overlap=settings.kb_chunk_overlap,
+    max_results=settings.kb_max_results,
+    similarity_threshold=settings.kb_similarity_threshold,
+    search_mode=settings.kb_search_mode,
+    chunk_strategy=settings.kb_chunk_strategy,
+    reranking_enabled=settings.kb_reranking_enabled,
+    reranking_model=settings.kb_reranking_model,
+    query_analytics=settings.kb_query_analytics,
+)
+
+conversation_service.kb_service = kb_service  # wire in after kb_service is created
+
 dataset_service = DatasetService(settings.audio_work_dir.parent / "dataset", audio_validator)
 
 from app.database import init_db
@@ -193,6 +273,15 @@ def get_settings() -> SettingsResponse:
 @app.post("/settings", response_model=SettingsResponse)
 def update_settings(payload: SettingsUpdateRequest) -> SettingsResponse:
     changed = settings.update_from_payload(payload.model_dump(exclude_none=True))
+    if changed:
+        try:
+            voice_studio_service.log_audit(
+                user_id="system",
+                event="settings_updated",
+                details=f"Updated settings: {', '.join(changed.keys())}"
+            )
+        except Exception:
+            pass
     if {"ollama_model", "ollama_base_url", "ollama_temperature", "ollama_num_predict", "ollama_keep_alive", "system_prompt"} & set(changed):
         llm_provider.base_url = settings.ollama_base_url
         llm_provider.model = settings.ollama_model
@@ -209,11 +298,52 @@ def update_settings(payload: SettingsUpdateRequest) -> SettingsResponse:
         rag_provider.settings = settings
         openwebui_llm_provider.settings = settings
         conversation_service.settings = settings
+    if {
+        "llm_provider",
+        "stt_provider",
+        "tts_provider",
+        "openai_api_key",
+        "openai_model",
+        "openai_tts_voice",
+        "cloud_fallback_to_local",
+        "cloud_timeout_seconds",
+        "cloud_temperature",
+        "cloud_max_tokens",
+        "bank_instruction",
+    } & set(changed):
+        conversation_service.settings = settings
+        openwebui_llm_provider.settings = settings
+        stt_provider.settings = settings
+        openai_tts.settings = settings
+        openai_tts.timeout_seconds = settings.cloud_timeout_seconds
     if {"internet_retrieval_enabled", "internet_max_sources", "internet_require_citation", "internet_fallback_allowed"} & set(changed):
         web_retrieval_provider.enabled = settings.internet_retrieval_enabled
         web_retrieval_provider.max_sources = settings.internet_max_sources
         web_retrieval_provider.require_citation = settings.internet_require_citation
         web_retrieval_provider.fallback_allowed = settings.internet_fallback_allowed
+    if {
+        "kb_embedding_provider",
+        "kb_embedding_model",
+        "kb_embedding_model_st",
+        "kb_chunk_size",
+        "kb_chunk_overlap",
+        "kb_max_results",
+        "kb_similarity_threshold",
+        "openai_api_key",
+        "cloud_timeout_seconds",
+    } & set(changed):
+        new_emb = get_embedding_provider(
+            settings.kb_embedding_provider,
+            settings.ollama_base_url,
+            _embedding_model_for(settings.kb_embedding_provider),
+            openai_api_key=settings.openai_api_key,
+            timeout_seconds=settings.cloud_timeout_seconds,
+        )
+        kb_service.embedding_provider = new_emb
+        kb_service.chunk_size = settings.kb_chunk_size
+        kb_service.chunk_overlap = settings.kb_chunk_overlap
+        kb_service.max_results = settings.kb_max_results
+        kb_service.similarity_threshold = settings.kb_similarity_threshold
     return SettingsResponse(settings=settings.public_dict())
 
 
@@ -425,10 +555,133 @@ def update_settings_ai_provider(payload: SettingsUpdateRequest) -> SettingsRespo
     return update_settings(payload)
 
 
+@app.post("/ai-providers/set-active")
+def set_active_ai_provider(payload: dict):
+    """Set the active LLM provider (local | openai | gemini)."""
+    provider = payload.get("provider", "local")
+    allowed = {"local", "openai", "gemini"}
+    if provider not in allowed:
+        return JSONResponse(status_code=400, content={"detail": f"Unknown provider: {provider}"})
+    settings.llm_provider = provider
+    settings._write_runtime_overrides()
+    try:
+        voice_studio_service.log_audit(
+            user_id="system",
+            event="active_provider_updated",
+            details=f"Set active LLM provider to: {provider}"
+        )
+    except Exception:
+        pass
+    return {"ok": True, "active_provider": provider}
+
+
+def _resolve_active_llm():
+    """Build the active LLM provider instance from settings.llm_provider."""
+    provider = settings.llm_provider or "local"
+    if provider == "openai":
+        from app.providers.llm_openai import OpenAILLMProvider
+        return OpenAILLMProvider(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model or "gpt-4o-mini",
+            temperature=settings.cloud_temperature,
+            max_tokens=settings.cloud_max_tokens,
+            timeout_seconds=settings.cloud_timeout_seconds,
+        )
+    if provider == "gemini":
+        from app.providers.llm_gemini import GeminiLLMProvider
+        return GeminiLLMProvider(
+            api_key=settings.gemini_api_key,
+            model=settings.gemini_model or "gemini-1.5-flash",
+            temperature=settings.cloud_temperature,
+            max_tokens=settings.cloud_max_tokens,
+            timeout_seconds=settings.cloud_timeout_seconds,
+        )
+    return OllamaLLMProvider(
+        base_url=settings.ollama_base_url,
+        model=settings.local_model or settings.ollama_model,
+        # SQL generation feeds a large schema prompt; CPU-only models need
+        # far more than the default chat timeout.
+        timeout_seconds=max(settings.ollama_timeout_seconds, 180.0),
+        retries=settings.ollama_retries,
+        temperature=settings.ollama_temperature,
+        num_predict=settings.ollama_num_predict,
+        keep_alive=settings.ollama_keep_alive,
+        system_prompt=settings.system_prompt,
+    )
+
+
+@app.get("/kyc/status")
+def kyc_status():
+    return kyc_service.status()
+
+
+@app.post("/kyc/query")
+def kyc_query(payload: dict):
+    question = (payload.get("question") or "").strip()
+    if not question:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "question is required"})
+    llm = _resolve_active_llm()
+    result = kyc_service.ask(question, llm)
+    if result.get("ok") and result.get("rows") is not None:
+        try:
+            import json as _json
+            preview = _json.dumps(result["rows"][:10], default=str)
+            summary = llm.chat(
+                preview,
+                system_prompt=(
+                    "Summarize this banking query result in 1-3 sentences for a bank officer. "
+                    f"Question: {question}"
+                ),
+            )
+            result["answer"] = summary.text.strip()
+        except Exception:
+            pass
+    return result
+
+
+@app.post("/admin/login")
+def admin_login(payload: dict):
+    session = admin_auth.login(payload.get("username", ""), payload.get("password", ""))
+    if session is None:
+        return JSONResponse(status_code=401, content={"ok": False, "detail": "Invalid username or password"})
+    return {"ok": True, **session}
+
+
+@app.post("/admin/logout")
+def admin_logout(payload: dict):
+    admin_auth.logout(payload.get("token", ""))
+    return {"ok": True}
+
+
+@app.get("/admin/verify")
+def admin_verify(token: str = ""):
+    session = admin_auth.verify(token)
+    if session is None:
+        return {"ok": False}
+    return {"ok": True, **session}
+
+
+@app.get("/ai-providers/openai/models")
+def get_openai_models_live():
+    """Fetch available OpenAI models from the API (live)."""
+    from app.providers.llm_openai import OpenAILLMProvider
+    p = OpenAILLMProvider(api_key=settings.openai_api_key, model=settings.openai_model or "gpt-4o-mini")
+    models = p.list_models_live()
+    return {"ok": True, "models": models, "current": settings.openai_model}
+
+
 @app.delete("/settings/openai-key", response_model=SettingsResponse)
 def delete_openai_key() -> SettingsResponse:
     settings.openai_api_key = ""
     settings._write_runtime_overrides()
+    try:
+        voice_studio_service.log_audit(
+            user_id="system",
+            event="openai_key_deleted",
+            details="OpenAI API key was deleted."
+        )
+    except Exception:
+        pass
     from app.services.environment import PROVIDER_TESTS
     PROVIDER_TESTS["openai"] = False
     return SettingsResponse(settings=settings.public_dict())
@@ -438,6 +691,14 @@ def delete_openai_key() -> SettingsResponse:
 def delete_gemini_key() -> SettingsResponse:
     settings.gemini_api_key = ""
     settings._write_runtime_overrides()
+    try:
+        voice_studio_service.log_audit(
+            user_id="system",
+            event="gemini_key_deleted",
+            details="Gemini API key was deleted."
+        )
+    except Exception:
+        pass
     from app.services.environment import PROVIDER_TESTS
     PROVIDER_TESTS["gemini"] = False
     return SettingsResponse(settings=settings.public_dict())
@@ -447,6 +708,14 @@ def delete_gemini_key() -> SettingsResponse:
 def delete_elevenlabs_key() -> SettingsResponse:
     settings.elevenlabs_api_key = ""
     settings._write_runtime_overrides()
+    try:
+        voice_studio_service.log_audit(
+            user_id="system",
+            event="elevenlabs_key_deleted",
+            details="ElevenLabs API key was deleted."
+        )
+    except Exception:
+        pass
     return SettingsResponse(settings=settings.public_dict())
 
 
@@ -579,6 +848,226 @@ def rag_sync():
     return rag_provider.sync()
 
 
+# ============================================================
+# Local Knowledge Base (ChromaDB) routes  — /kb/*
+# ============================================================
+
+@app.get("/kb/status")
+def kb_status():
+    return kb_service.status()
+
+
+@app.get("/kb/embedding/status")
+def kb_embedding_status():
+    return kb_service.embedding_provider.status()
+
+
+@app.get("/kb/collections")
+def kb_list_collections():
+    cols = kb_service.list_collections()
+    return {"collections": [vars(c) for c in cols]}
+
+
+@app.post("/kb/collections")
+def kb_create_collection(payload: dict):
+    name = (payload.get("name") or "").strip()
+    if not name:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="Collection name is required.")
+    description = payload.get("description", "")
+    col = kb_service.create_collection(name, description)
+    return vars(col)
+
+
+@app.delete("/kb/collections/{collection_id}")
+def kb_delete_collection(collection_id: str):
+    ok = kb_service.delete_collection(collection_id)
+    if not ok:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Collection not found.")
+    return {"ok": True}
+
+
+@app.get("/kb/collections/{collection_id}")
+def kb_get_collection(collection_id: str):
+    col = kb_service.get_collection(collection_id)
+    if not col:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Collection not found.")
+    return vars(col)
+
+
+@app.get("/kb/collections/{collection_id}/documents")
+def kb_list_documents(collection_id: str):
+    docs = kb_service.list_documents(collection_id)
+    return {"documents": [vars(d) for d in docs]}
+
+
+@app.post("/kb/collections/{collection_id}/ingest")
+async def kb_ingest_file(collection_id: str, file: UploadFile = File(...)):
+    data = await file.read()
+    try:
+        doc = kb_service.ingest_file(collection_id, data, file.filename or "upload", file.content_type)
+        return {"ok": True, "document": vars(doc)}
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+
+
+@app.post("/kb/collections/{collection_id}/ingest-url")
+def kb_ingest_url(collection_id: str, payload: dict):
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "URL is required."})
+    try:
+        doc = kb_service.ingest_url(collection_id, url)
+        return {"ok": True, "document": vars(doc)}
+    except (ValueError, RuntimeError) as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+
+
+@app.post("/kb/collections/{collection_id}/crawl-site")
+def kb_crawl_site(collection_id: str, payload: dict):
+    """Stream a full-site crawl via Server-Sent Events (NDJSON lines).
+
+    Body: { url, max_pages?, same_domain_only?, delay_ms? }
+    Response: text/event-stream — each line is a JSON event.
+    """
+    from fastapi.responses import StreamingResponse
+
+    url = (payload.get("url") or "").strip()
+    if not url:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "url is required"})
+
+    max_pages = int(payload.get("max_pages", 500))
+    same_domain_only = bool(payload.get("same_domain_only", True))
+    delay_ms = int(payload.get("delay_ms", 150))
+
+    def _stream():
+        import json as _json
+        try:
+            for event in kb_service.crawl_site(
+                collection_id=collection_id,
+                start_url=url,
+                max_pages=max_pages,
+                same_domain_only=same_domain_only,
+                delay_ms=delay_ms,
+            ):
+                yield f"data: {_json.dumps(event)}\n\n"
+        except Exception as exc:
+            yield f"data: {_json.dumps({'status': 'fatal', 'error': str(exc)})}\n\n"
+
+    return StreamingResponse(_stream(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.delete("/kb/collections/{collection_id}/documents/{doc_id}")
+def kb_delete_document(collection_id: str, doc_id: str):
+    ok = kb_service.delete_document(collection_id, doc_id)
+    if not ok:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {"ok": True}
+
+
+@app.patch("/kb/collections/{collection_id}/documents/{doc_id}")
+def kb_rename_document(collection_id: str, doc_id: str, payload: dict):
+    """Rename a document (update filename in metadata)."""
+    new_name = (payload.get("filename") or "").strip()
+    if not new_name:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "filename is required."})
+    m = kb_service._meta.get(collection_id, {})
+    if doc_id not in m.get("documents", {}):
+        return JSONResponse(status_code=404, content={"ok": False, "detail": "Document not found."})
+    kb_service._meta[collection_id]["documents"][doc_id]["filename"] = new_name
+    kb_service._save_meta()
+    return {"ok": True, "filename": new_name}
+
+
+@app.get("/kb/collections/{collection_id}/documents/{doc_id}/chunks")
+def kb_get_document_chunks(collection_id: str, doc_id: str, limit: int = 5):
+    """Return first N chunks of a document for preview."""
+    try:
+        col = kb_service._get_chroma_collection(collection_id)
+        result = col.get(where={"doc_id": doc_id}, limit=limit, include=["documents", "metadatas"])
+        chunks = []
+        for text, meta in zip(result.get("documents", []), result.get("metadatas", [])):
+            chunks.append({"text": text, "chunk_index": meta.get("chunk_index", 0)})
+        chunks.sort(key=lambda c: c["chunk_index"])
+        return {"ok": True, "chunks": chunks}
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+
+
+@app.post("/kb/query")
+def kb_query(payload: dict):
+    query_text = (payload.get("query") or "").strip()
+    if not query_text:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "query is required."})
+    collection_ids = payload.get("collection_ids") or None
+    n_results = int(payload.get("n_results") or kb_service.max_results)
+    results = kb_service.query(query_text, collection_ids, n_results)
+    return {
+        "ok": True,
+        "query": query_text,
+        "results": [vars(r) for r in results],
+        "context": kb_service._build_context_from_results(results),
+    }
+
+
+@app.post("/kb/query/advanced")
+def kb_query_advanced(payload: dict):
+    """Advanced RAG query: hybrid/semantic/keyword, reranking, metadata filters."""
+    query_text = (payload.get("query") or "").strip()
+    if not query_text:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": "query is required."})
+    return kb_service.query_advanced(
+        query_text=query_text,
+        collection_ids=payload.get("collection_ids") or None,
+        n_results=int(payload.get("n_results") or kb_service.max_results),
+        mode=payload.get("mode") or kb_service.search_mode,
+        source_type_filter=payload.get("source_type_filter") or None,
+        rerank=bool(payload.get("rerank", kb_service.reranking_enabled)),
+        min_score=float(payload["min_score"]) if payload.get("min_score") is not None else None,
+        doc_id_filter=payload.get("doc_id_filter") or None,
+    )
+
+
+@app.post("/kb/reindex")
+def kb_reindex_all():
+    """Re-embed ALL collections with the current active embedding provider."""
+    return kb_service.reindex_all()
+
+
+@app.post("/kb/collections/{collection_id}/reindex")
+def kb_reindex_collection(collection_id: str):
+    """Re-embed a single collection with the current active embedding provider."""
+    result = kb_service.reindex_collection(collection_id)
+    if not result.get("ok"):
+        return JSONResponse(status_code=400, content=result)
+    return result
+
+
+@app.get("/kb/analytics")
+def kb_get_analytics(limit: int = 100):
+    return kb_service.get_analytics(limit=limit)
+
+
+@app.delete("/kb/analytics")
+def kb_clear_analytics():
+    kb_service.clear_analytics()
+    return {"ok": True}
+
+
+@app.get("/kb/collections/{collection_id}/stats")
+def kb_collection_stats(collection_id: str):
+    return kb_service.get_collection_stats(collection_id)
+
+
+@app.get("/kb/collections/{collection_id}/export")
+def kb_export_collection(collection_id: str):
+    return kb_service.export_collection(collection_id)
+
+
 @app.get("/web-retrieval/status")
 def web_retrieval_status():
     return web_retrieval_provider.status().to_dict()
@@ -592,7 +1081,9 @@ def chat_test(payload: ChatTestRequest):
         knowledge_id=payload.knowledge_id,
         use_internet=payload.use_internet,
         llm_provider_id=payload.llm_provider_id,
+        stt_provider_id=payload.stt_provider_id,
     )
+
 
 
 @app.get("/chat/history")
@@ -714,6 +1205,23 @@ def tts_test(payload: TtsTestRequest) -> TtsTestResponse:
     return TtsTestResponse(language=language, audio_url=f"/audio/{result.audio_path.name}")
 
 
+class TtsPreviewRequest(BaseModel):
+    text: str
+    voice_id: str = "openai-alloy"
+    language: str = "en"
+
+
+@app.post("/tts/preview")
+def tts_preview(payload: TtsPreviewRequest):
+    """Preview a specific voice (Piper built-in or OpenAI cloud voice)."""
+    parts = [TTSPart(text=payload.text, language=payload.language)]
+    try:
+        result = tts_provider.synthesize(parts, voice_id=payload.voice_id, fallback_allowed=False)
+        return {"ok": True, "audio_url": f"/audio/{result.audio_path.name}", "voice_id": payload.voice_id, "engine": result.actual_tts_engine}
+    except Exception as exc:
+        return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+
+
 @app.post("/stt/test")
 async def stt_test(upload: UploadFile = File(...)):
     audio_path = audio_pipeline.prepare_stt_audio(await upload.read(), upload.content_type)
@@ -826,8 +1334,77 @@ def export_dataset():
     )
 
 
+@app.post("/voice/turn")
+async def chat_voice(
+    audio: UploadFile = File(...),
+    voice_id: str = Form(default=""),
+    knowledge_id: str = Form(default=""),
+    use_internet: bool = Form(default=False),
+    llm_provider_id: str = Form(default=""),
+    stt_provider_id: str = Form(default=""),
+    stt_language: str = Form(default=""),
+):
+    """REST fallback for voice turns — accepts audio upload, returns full turn JSON."""
+    import asyncio
+    audio_bytes = await audio.read()
+    audio_path = audio_pipeline.prepare_stt_audio(audio_bytes, audio.content_type)
+    try:
+        turn = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: conversation_service.handle_audio(
+                audio_path,
+                voice_id=voice_id or None,
+                knowledge_id=knowledge_id or None,
+                use_internet=use_internet,
+                llm_provider_id=llm_provider_id or None,
+                stt_provider_id=stt_provider_id or None,
+                stt_language=stt_language or None,
+            ),
+        )
+        return turn
+    finally:
+        audio_pipeline.cleanup_turn_audio(audio_path)
+
+
+
+def _classify_transcript_language(text: str) -> str:
+    """Lightweight language tag for live partials: ne | en | mixed | unknown."""
+    try:
+        return language_router.detect(text).language
+    except Exception:
+        return "unknown"
+
+
+def _transcribe_blob_sync(
+    audio_b64: str,
+    mime_type: str | None,
+    stt_provider_id: str | None,
+    stt_language: str | None,
+):
+    """Decode a base64 audio blob to a temp wav and run the active STT router.
+
+    Returns the STTResult. Caller handles cleanup. Used for BOTH live partials
+    (transcribe-only) and the authoritative final transcription. STT provider
+    selection follows the same OpenAI-first / local-fallback routing as REST.
+    """
+    audio_bytes = base64.b64decode(audio_b64, validate=True)
+    if not audio_bytes:
+        raise ValueError("audio data is empty")
+    audio_path = audio_pipeline.prepare_stt_audio(audio_bytes, mime_type)
+    try:
+        return stt_provider.transcribe_file(
+            audio_path,
+            provider_name=stt_provider_id or None,
+            language=stt_language or None,
+        ), audio_path
+    except Exception:
+        audio_pipeline.cleanup_turn_audio(audio_path)
+        raise
+
+
 @app.websocket("/ws/voice")
 async def voice_socket(websocket: WebSocket):
+    import asyncio
     await websocket.accept()
     socket_status = build_voice_socket_status(settings)
     hello_received = False
@@ -835,6 +1412,8 @@ async def voice_socket(websocket: WebSocket):
     session_knowledge_id = None
     session_use_internet = False
     session_llm_provider_id = None
+    session_stt_provider_id = None
+    session_stt_language = None
     try:
         while True:
             message = await websocket.receive_json()
@@ -847,6 +1426,8 @@ async def voice_socket(websocket: WebSocket):
                 session_knowledge_id = message.get("selected_knowledge_id")
                 session_use_internet = bool(message.get("use_internet", False))
                 session_llm_provider_id = message.get("selected_brain")
+                session_stt_provider_id = message.get("selected_stt_provider")
+                session_stt_language = message.get("selected_stt_language")
                 socket_status = build_voice_socket_status(settings)
                 hello_received = True
                 await websocket.send_json(
@@ -858,6 +1439,106 @@ async def voice_socket(websocket: WebSocket):
                         "warnings": socket_status["warnings"],
                     }
                 )
+                continue
+            if message_type == "config":
+                # Real-time contract: set session params for the next turn.
+                if message.get("voice_id") is not None:
+                    session_voice_id = message.get("voice_id")
+                if message.get("knowledge_id") is not None:
+                    session_knowledge_id = message.get("knowledge_id")
+                if message.get("llm_provider") is not None:
+                    session_llm_provider_id = message.get("llm_provider")
+                if message.get("stt_language") is not None:
+                    lang = message.get("stt_language")
+                    session_stt_language = None if lang in ("auto", "", None) else lang
+                if message.get("use_internet") is not None:
+                    session_use_internet = bool(message.get("use_internet"))
+                hello_received = True
+                await websocket.send_json({"type": "config_ack"})
+                continue
+            if message_type == "audio_partial":
+                # Live partial: transcribe ONLY (no LLM) so the display stays fast.
+                try:
+                    stt_result, audio_path = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: _transcribe_blob_sync(
+                            str(message.get("data", "")),
+                            message.get("mime"),
+                            session_stt_provider_id,
+                            session_stt_language,
+                        ),
+                    )
+                except (binascii.Error, ValueError) as exc:
+                    await websocket.send_json({"type": "error", "detail": f"Invalid audio_partial: {exc}"})
+                    continue
+                except Exception as exc:
+                    await websocket.send_json({"type": "error", "detail": f"Partial transcription failed: {exc}"})
+                    continue
+                try:
+                    text = (stt_result.text or "").strip()
+                    await websocket.send_json(
+                        {
+                            "type": "partial_transcript",
+                            "text": text,
+                            "language": _classify_transcript_language(text) if text else "unknown",
+                        }
+                    )
+                finally:
+                    audio_pipeline.cleanup_turn_audio(audio_path)
+                continue
+            if message_type == "audio_end":
+                # Authoritative final transcription, then full RAG -> LLM -> TTS turn.
+                if not socket_status["capabilities"].get("audio_turns"):
+                    await websocket.send_json(
+                        {
+                            "type": "setup_required",
+                            "detail": "Voice turns are blocked by runtime setup.",
+                            "blocking_reasons": socket_status["blocking_reasons"],
+                        }
+                    )
+                    continue
+                await websocket.send_json({"type": "status", "status": "transcribing"})
+                try:
+                    audio_bytes = base64.b64decode(str(message.get("data", "")), validate=True)
+                except (binascii.Error, ValueError):
+                    await websocket.send_json({"type": "error", "detail": "Invalid audio_end: data must be valid base64."})
+                    continue
+                if not audio_bytes:
+                    await websocket.send_json({"type": "error", "detail": "Invalid audio_end: data is empty."})
+                    continue
+                audio_path = audio_pipeline.prepare_stt_audio(audio_bytes, message.get("mime"))
+                try:
+                    await websocket.send_json({"type": "status", "status": "thinking"})
+                    turn = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: conversation_service.handle_audio(
+                            audio_path,
+                            voice_id=session_voice_id,
+                            knowledge_id=session_knowledge_id,
+                            use_internet=session_use_internet,
+                            llm_provider_id=session_llm_provider_id,
+                            session_id=socket_status.get("session_id"),
+                            stt_provider_id=session_stt_provider_id,
+                            stt_language=session_stt_language,
+                        ),
+                    )
+                    turn_payload = turn.model_dump()
+                    await websocket.send_json(
+                        {
+                            "type": "final_transcript",
+                            "text": turn_payload.get("transcript", ""),
+                            "language": turn_payload.get("input_language", "unknown"),
+                        }
+                    )
+                    await websocket.send_json({"type": "status", "status": "speaking"})
+                    await websocket.send_json({"type": "answer", "turn": turn_payload})
+                except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
+                    await websocket.send_json({"type": "error", "detail": str(exc)})
+                    await websocket.send_json({"type": "status", "status": "error"})
+                finally:
+                    audio_pipeline.cleanup_turn_audio(audio_path)
                 continue
             if not hello_received:
                 await websocket.send_json(
@@ -882,13 +1563,18 @@ async def voice_socket(websocket: WebSocket):
                             }
                         )
                         continue
-                    turn = conversation_service.handle_text(
-                        str(message.get("text", "")),
-                        voice_id=session_voice_id,
-                        knowledge_id=session_knowledge_id,
-                        use_internet=session_use_internet,
-                        llm_provider_id=session_llm_provider_id,
-                        session_id=socket_status.get("session_id"),
+                    # Run blocking I/O in thread pool to avoid blocking the event loop
+                    turn = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: conversation_service.handle_text(
+                            str(message.get("text", "")),
+                            voice_id=session_voice_id,
+                            knowledge_id=session_knowledge_id,
+                            use_internet=session_use_internet,
+                            llm_provider_id=session_llm_provider_id,
+                            session_id=socket_status.get("session_id"),
+                            stt_provider_id=session_stt_provider_id,
+                        ),
                     )
                 elif message_type == "audio":
                     if not socket_status["capabilities"].get("audio_turns"):
@@ -911,16 +1597,24 @@ async def voice_socket(websocket: WebSocket):
                         continue
                     audio_path = audio_pipeline.prepare_stt_audio(audio_bytes, message.get("mimeType"))
                     try:
-                        turn = conversation_service.handle_audio(
-                            audio_path,
-                            voice_id=session_voice_id,
-                            knowledge_id=session_knowledge_id,
-                            use_internet=session_use_internet,
-                            llm_provider_id=session_llm_provider_id,
-                            session_id=socket_status.get("session_id"),
+                        # Run blocking STT+LLM+TTS in thread pool
+                        turn = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: conversation_service.handle_audio(
+                                audio_path,
+                                voice_id=session_voice_id,
+                                knowledge_id=session_knowledge_id,
+                                use_internet=session_use_internet,
+                                llm_provider_id=session_llm_provider_id,
+                                session_id=socket_status.get("session_id"),
+                                stt_provider_id=session_stt_provider_id,
+                                stt_language=session_stt_language,
+                            ),
                         )
+
                     finally:
                         audio_pipeline.cleanup_turn_audio(audio_path)
+
                 else:
                     await websocket.send_json({"type": "error", "detail": f"Unknown message type: {message_type}"})
                     continue
@@ -1008,11 +1702,14 @@ async def upload_voice_recording(voice_id: str, prompt_id: str, upload: UploadFi
     if wav_path.exists():
         match_res = speaker_isolation_service.verify_speaker_match(voice_id, wav_path, lock_if_empty=True)
         if not match_res["matched"]:
-            verdict = "reject"
-            score = min(score, 40)
+            # Downgrade score but only hard-reject if truly a different speaker (similarity very low)
+            score_penalty = 20 if match_res["score"] < 50 else 10
+            score = max(0, score - score_penalty)
             reason = f"{reason}, {match_res['reason']}" if reason and reason != "clean" else match_res["reason"]
-            
-            # Update SQLite database with rejection status
+            # Hard reject only if clearly a different person
+            if match_res["score"] < 40:
+                verdict = "reject"
+                score = min(score, 30)
             from app.database import get_db_connection
             conn = get_db_connection()
             try:
@@ -1228,6 +1925,30 @@ def clone_voice(voice_id: str):
         
     return {"ok": True, "job_id": job_id, "status": "completed"}
 
+@app.post("/voices/{voice_id}/preview")
+async def preview_cloned_voice(voice_id: str):
+    """Synthesize a short test phrase with the cloned voice so the user can hear it."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    conn = get_db_connection()
+    try:
+        voice = conn.execute("SELECT * FROM voices WHERE id = ?;", (voice_id,)).fetchone()
+        if not voice:
+            raise HTTPException(status_code=404, detail="Voice not found.")
+        if voice["status"] not in ("ready", "published"):
+            raise HTTPException(status_code=400, detail="Voice is not ready yet. Clone it first.")
+    finally:
+        conn.close()
+
+    test_text = "Hello! This is how my cloned voice sounds. नमस्ते, यो मेरो क्लोन गरिएको आवाज हो।"
+    parts = language_router.route(test_text)
+    try:
+        result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=False)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Preview synthesis failed: {exc}")
+    return FileResponse(str(result.audio_path), media_type="audio/wav", filename="preview.wav")
+
+
 @app.delete("/voices/{voice_id}")
 def delete_voice(voice_id: str):
     voice_studio_service.delete_voice(voice_id)
@@ -1291,7 +2012,7 @@ def clean_recording_endpoint(voice_id: str, prompt_id: str):
         if shutil.which("ffmpeg") is None:
             raise HTTPException(status_code=500, detail="ffmpeg is not installed on this system.")
         subprocess.run(
-            ["ffmpeg", "-y", "-i", str(raw_path), "-ac", "1", "-ar", "22050", "-sample_fmt", "s16", str(temp_wav)],
+            ["ffmpeg", "-y", "-i", str(raw_path), "-ac", "1", "-ar", "24000", "-sample_fmt", "s16", str(temp_wav)],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             check=True,

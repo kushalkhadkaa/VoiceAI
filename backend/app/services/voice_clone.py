@@ -27,9 +27,9 @@ class VoiceCloneService:
         voice_dir = self.voices_base_dir / voice_id
         voice_dir.mkdir(parents=True, exist_ok=True)
         reference_path = voice_dir / "chatterbox_reference.wav"
-        seconds = self._write_reference_wav(wav_paths, reference_path, max_seconds=30.0)
-        if seconds < 3.0:
-            raise VoiceCloneError("At least 3 seconds of clean reference audio are required for Chatterbox cloning.")
+        seconds = self._write_reference_wav(wav_paths, reference_path, max_seconds=60.0)
+        if seconds < 2.0:
+            raise VoiceCloneError("At least 2 seconds of clean reference audio are required for voice cloning.")
 
         manifest = {
             "engine": "chatterbox",
@@ -168,6 +168,7 @@ class VoiceCloneService:
         if params is None or written_frames == 0:
             raise VoiceCloneError("Unable to write clone reference audio.")
 
+        params = params._replace(nframes=written_frames)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with wave.open(str(output_path), "wb") as output:
             output.setparams(params)

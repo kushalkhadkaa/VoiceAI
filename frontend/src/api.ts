@@ -1,6 +1,6 @@
-import type { BackendSettings, ConversationTurn, ProviderStatus, RagStatus, SystemInfo, SystemMetrics, VoiceSocketStatus, VoicesResponse, DatasetRecording } from "./types";
+import type { BackendSettings, ConversationTurn, KBCollection, KBDocument, KBSearchResult, KBStatus, ProviderStatus, RagStatus, SystemInfo, SystemMetrics, VoiceSocketStatus, VoicesResponse, DatasetRecording } from "./types";
 
-export const API_HTTP = import.meta.env.VITE_API_HTTP ?? "http://localhost:8000";
+export const API_HTTP = import.meta.env.VITE_API_HTTP ?? "http://localhost:8001";
 
 export function deriveVoiceSocketUrl(httpUrl = API_HTTP): string {
   if (import.meta.env.VITE_API_WS) {
@@ -14,7 +14,7 @@ export function deriveVoiceSocketUrl(httpUrl = API_HTTP): string {
     url.hash = "";
     return url.toString();
   } catch {
-    return "ws://localhost:8000/ws/voice";
+    return "ws://localhost:8001/ws/voice";
   }
 }
 
@@ -103,6 +103,7 @@ export async function sendTextTurn(
     knowledge_id?: string;
     use_internet?: boolean;
     llm_provider_id?: string;
+    stt_language?: string;
   }
 ): Promise<ConversationTurn> {
   const response = await fetch(`${API_HTTP}/chat/test`, {
@@ -128,6 +129,37 @@ export async function testTts(text: string, language: "ne" | "en") {
     throw new Error(payload?.detail ?? "TTS test failed.");
   }
   return response.json() as Promise<{ language: string; audio_url: string }>;
+}
+
+export async function voiceTurnRest(
+  audioBlob: Blob,
+  options?: { voice_id?: string; knowledge_id?: string; use_internet?: boolean; llm_provider_id?: string; stt_provider_id?: string; stt_language?: string }
+): Promise<ConversationTurn> {
+  const form = new FormData();
+  form.append("audio", audioBlob, "recording.webm");
+  if (options?.voice_id) form.append("voice_id", options.voice_id);
+  if (options?.knowledge_id) form.append("knowledge_id", options.knowledge_id);
+  form.append("use_internet", String(options?.use_internet ?? false));
+  if (options?.llm_provider_id) form.append("llm_provider_id", options.llm_provider_id);
+  if (options?.stt_provider_id) form.append("stt_provider_id", options.stt_provider_id);
+  if (options?.stt_language) form.append("stt_language", options.stt_language);
+  const response = await fetch(`${API_HTTP}/voice/turn`, { method: "POST", body: form });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.detail ?? "Voice turn failed.");
+  }
+  return response.json();
+}
+
+
+
+export async function previewTts(text: string, voiceId: string, language = "en"): Promise<{ ok: boolean; audio_url?: string; detail?: string; engine?: string }> {
+  const response = await fetch(`${API_HTTP}/tts/preview`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice_id: voiceId, language })
+  });
+  return response.json();
 }
 
 export async function deleteLocalData(): Promise<void> {
@@ -353,6 +385,161 @@ export async function downloadDefaultVoices(): Promise<void> {
   }
 }
 
+// ============================================================
+// Local Knowledge Base API  (/kb/*)
+// ============================================================
+
+export async function getKBStatus(): Promise<KBStatus | null> {
+  const r = await fetch(`${API_HTTP}/kb/status`);
+  return r.ok ? r.json() : null;
+}
+
+export async function getKBCollections(): Promise<KBCollection[]> {
+  const r = await fetch(`${API_HTTP}/kb/collections`);
+  if (!r.ok) return [];
+  const data = await r.json();
+  return data.collections ?? [];
+}
+
+export async function createKBCollection(name: string, description: string): Promise<KBCollection> {
+  const r = await fetch(`${API_HTTP}/kb/collections`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, description }),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => null);
+    throw new Error(d?.detail ?? "Failed to create collection.");
+  }
+  return r.json();
+}
+
+export async function deleteKBCollection(collectionId: string): Promise<void> {
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}`, { method: "DELETE" });
+  if (!r.ok) throw new Error("Failed to delete collection.");
+}
+
+export async function getKBDocuments(collectionId: string): Promise<KBDocument[]> {
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/documents`);
+  if (!r.ok) return [];
+  const data = await r.json();
+  return data.documents ?? [];
+}
+
+export async function ingestKBFile(collectionId: string, file: File): Promise<KBDocument> {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/ingest`, {
+    method: "POST",
+    body: form,
+  });
+  const data = await r.json();
+  if (!r.ok || !data.ok) throw new Error(data?.detail ?? "Ingest failed.");
+  return data.document;
+}
+
+export async function ingestKBUrl(collectionId: string, url: string): Promise<KBDocument> {
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/ingest-url`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  const data = await r.json();
+  if (!r.ok || !data.ok) throw new Error(data?.detail ?? "URL ingest failed.");
+  return data.document;
+}
+
+export async function deleteKBDocument(collectionId: string, docId: string): Promise<void> {
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/documents/${docId}`, { method: "DELETE" });
+  if (!r.ok) throw new Error("Failed to delete document.");
+}
+
+export async function renameKBDocument(collectionId: string, docId: string, filename: string): Promise<{ ok: boolean }> {
+  const res = await fetch(`${API_HTTP}/kb/collections/${collectionId}/documents/${docId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ filename })
+  });
+  return res.json();
+}
+
+export async function getKBDocumentChunks(collectionId: string, docId: string, limit = 10): Promise<{ ok: boolean; chunks: Array<{ text: string; chunk_index: number }> }> {
+  const res = await fetch(`${API_HTTP}/kb/collections/${collectionId}/documents/${docId}/chunks?limit=${limit}`);
+  return res.json();
+}
+
+export async function queryKB(query: string, collectionIds?: string[], nResults?: number): Promise<{ ok: boolean; results: KBSearchResult[]; context: string }> {
+  const r = await fetch(`${API_HTTP}/kb/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query, collection_ids: collectionIds ?? null, n_results: nResults ?? 5 }),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => null);
+    throw new Error(d?.detail ?? "Query failed.");
+  }
+  return r.json();
+}
+
+export async function getKBEmbeddingStatus(): Promise<any> {
+  const r = await fetch(`${API_HTTP}/kb/embedding/status`);
+  return r.ok ? r.json() : null;
+}
+
+export interface AdvancedQueryOptions {
+  query: string;
+  collection_ids?: string[];
+  n_results?: number;
+  mode?: "semantic" | "keyword" | "hybrid";
+  source_type_filter?: "file" | "url";
+  rerank?: boolean;
+  min_score?: number;
+  doc_id_filter?: string;
+}
+
+export async function queryKBAdvanced(opts: AdvancedQueryOptions): Promise<{
+  ok: boolean; query: string; mode: string; reranked: boolean;
+  elapsed_ms: number; result_count: number; results: KBSearchResult[]; context: string;
+}> {
+  const r = await fetch(`${API_HTTP}/kb/query/advanced`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => null);
+    throw new Error(d?.detail ?? "Advanced query failed.");
+  }
+  return r.json();
+}
+
+export async function getKBAnalytics(limit = 100): Promise<{
+  ok: boolean; total_queries: number; avg_results: number; avg_latency_ms: number;
+  zero_result_queries: number; top_queries: Array<{ query: string; count: number }>;
+  recent: any[];
+}> {
+  const r = await fetch(`${API_HTTP}/kb/analytics?limit=${limit}`);
+  return r.ok ? r.json() : { ok: false, total_queries: 0, avg_results: 0, avg_latency_ms: 0, zero_result_queries: 0, top_queries: [], recent: [] };
+}
+
+export async function clearKBAnalytics(): Promise<void> {
+  await fetch(`${API_HTTP}/kb/analytics`, { method: "DELETE" });
+}
+
+export async function getKBCollectionStats(collectionId: string): Promise<any> {
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/stats`);
+  return r.ok ? r.json() : null;
+}
+
+export async function exportKBCollection(collectionId: string): Promise<any> {
+  const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/export`);
+  return r.ok ? r.json() : null;
+}
+
+// ============================================================
+// Legacy RAG (Open WebUI) API
+// ============================================================
+
 export async function getRagCollections(): Promise<any[]> {
   const response = await fetch(`${API_HTTP}/rag/collections`);
   if (!response.ok) {
@@ -439,6 +626,74 @@ export async function deleteElevenLabsKey(): Promise<BackendSettings> {
   return payload.settings;
 }
 
+export async function setActiveAIProvider(provider: string): Promise<{ ok: boolean; active_provider: string }> {
+  const r = await fetch(`${API_HTTP}/ai-providers/set-active`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ provider }),
+  });
+  if (!r.ok) {
+    const d = await r.json().catch(() => null);
+    throw new Error(d?.detail ?? "Failed to set active provider.");
+  }
+  return r.json();
+}
+
+export async function getOpenAIModels(): Promise<{ ok: boolean; models: string[]; current: string }> {
+  const r = await fetch(`${API_HTTP}/ai-providers/openai/models`);
+  return r.ok ? r.json() : { ok: false, models: [], current: "" };
+}
+
+export interface CrawlSiteOptions {
+  url: string;
+  max_pages?: number;
+  same_domain_only?: boolean;
+  delay_ms?: number;
+}
+
+export type CrawlEvent =
+  | { status: "crawling"; url: string; page: number; total_queued: number; ingested: number; failed: number }
+  | { status: "saved"; url: string; doc_id: string; chunks: number; page: number; total_queued: number; ingested: number; failed: number }
+  | { status: "skipped"; url: string; reason: string; ingested: number; failed: number }
+  | { status: "error"; url: string; error: string; ingested: number; failed: number }
+  | { status: "done"; start_url: string; ingested: number; failed: number; total_visited: number }
+  | { status: "fatal"; error: string };
+
+export function crawlKBSite(
+  collectionId: string,
+  opts: CrawlSiteOptions,
+  onEvent: (evt: CrawlEvent) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return fetch(`${API_HTTP}/kb/collections/${collectionId}/crawl-site`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+    signal,
+  }).then(async (resp) => {
+    if (!resp.ok) {
+      const d = await resp.json().catch(() => null);
+      throw new Error(d?.detail ?? "Crawl failed to start.");
+    }
+    const reader = resp.body!.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split("\n");
+      buf = lines.pop() ?? "";
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith("data: ")) {
+          try { onEvent(JSON.parse(trimmed.slice(6))); } catch {}
+        }
+      }
+    }
+  });
+}
+
 export async function getChatHistory(limit = 50): Promise<ConversationTurn[]> {
   const response = await fetch(`${API_HTTP}/chat/history?limit=${limit}`);
   if (!response.ok) {
@@ -478,3 +733,77 @@ export async function rateChatTurn(
   }
 }
 
+
+// ── Admin authentication ────────────────────────────────────────────────────
+export interface AdminLoginResult {
+  ok: boolean;
+  token?: string;
+  username?: string;
+  role?: string;
+  detail?: string;
+}
+
+export async function adminLogin(username: string, password: string): Promise<AdminLoginResult> {
+  const response = await fetch(`${API_HTTP}/admin/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password })
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    return { ok: false, detail: payload?.detail ?? "Invalid username or password." };
+  }
+  return payload as AdminLoginResult;
+}
+
+export async function adminLogout(token: string): Promise<{ ok: boolean }> {
+  const response = await fetch(`${API_HTTP}/admin/logout`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token })
+  });
+  if (!response.ok) {
+    return { ok: false };
+  }
+  return response.json();
+}
+
+export async function adminVerify(token: string): Promise<boolean> {
+  const response = await fetch(`${API_HTTP}/admin/verify?token=${encodeURIComponent(token)}`);
+  if (!response.ok) {
+    return false;
+  }
+  const payload = await response.json().catch(() => null);
+  return Boolean(payload?.ok);
+}
+
+// ── KYC natural-language query ──────────────────────────────────────────────
+export interface KycQueryResult {
+  ok: boolean;
+  sql?: string;
+  rows?: Record<string, unknown>[];
+  row_count?: number;
+  answer?: string;
+  error?: string;
+}
+
+export async function kycQuery(question: string): Promise<KycQueryResult> {
+  const response = await fetch(`${API_HTTP}/kyc/query`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question })
+  });
+  const payload = await response.json().catch(() => null);
+  if (!response.ok) {
+    return { ok: false, error: payload?.error ?? payload?.detail ?? `KYC query failed (${response.status}).` };
+  }
+  return payload as KycQueryResult;
+}
+
+export async function kycStatus(): Promise<{ ok: boolean; connected: boolean; row_count: number }> {
+  const response = await fetch(`${API_HTTP}/kyc/status`);
+  if (!response.ok) {
+    throw new Error("Unable to read KYC status.");
+  }
+  return response.json();
+}

@@ -1,6 +1,6 @@
 export type LanguageCode = "ne" | "en" | "mixed" | "unknown";
 export type AssistantStatus = "idle" | "listening" | "transcribing" | "thinking" | "speaking" | "error";
-export type ViewId = "conversation" | "voice_studio" | "knowledge" | "setup" | "evaluation" | "admin" | "logs" | "settings";
+export type ViewId = "conversation" | "voice_studio" | "knowledge" | "setup" | "evaluation" | "admin" | "logs" | "system_map" | "settings";
 
 export interface TimingMetrics {
   audio_received_to_transcript_ms?: number | null;
@@ -43,7 +43,12 @@ export interface ConversationTurn {
   fallback_reason?: string | null;
   llm_provider?: string | null;
   rag_path?: string | null;
+  is_pending?: boolean;
+  transcript_translation?: string | null;
+  response_translation?: string | null;
 }
+
+
 
 export interface SystemMetrics {
   os?: string;
@@ -89,6 +94,69 @@ export interface RagStatus {
   fallback_to_ollama: boolean;
 }
 
+export interface KBCollection {
+  id: string;
+  name: string;
+  description: string;
+  created_at: string;
+  document_count: number;
+  chunk_count: number;
+}
+
+export interface KBDocument {
+  id: string;
+  collection_id: string;
+  filename: string;
+  source_type: "file" | "url";
+  source_url: string | null;
+  content_hash: string;
+  chunk_count: number;
+  created_at: string;
+  size_bytes: number;
+}
+
+export interface KBSearchResult {
+  chunk_id: string;
+  doc_id: string;
+  doc_name: string;
+  collection_id: string;
+  text: string;
+  score: number;
+  chunk_index: number;
+  source_type?: string;
+  source_url?: string | null;
+  semantic_score?: number | null;
+  bm25_score?: number | null;
+  rerank_score?: number | null;
+  page_number?: number | null;
+}
+
+export interface KBStatus {
+  ok: boolean;
+  mode: string;
+  db_path: string;
+  search_mode?: string;
+  chunk_strategy?: string;
+  reranking_enabled?: boolean;
+  reranking_model?: string;
+  embedding: {
+    ok: boolean;
+    provider: string;
+    model: string;
+    detail: string;
+    model_available?: boolean;
+    dimensions?: number;
+  };
+  collection_count: number;
+  document_count: number;
+  chunk_count: number;
+  capabilities?: {
+    bm25_available: boolean;
+    reranker_available: boolean;
+    hybrid_search: boolean;
+  };
+}
+
 export interface ProviderStatus {
   name: string;
   ok: boolean;
@@ -115,6 +183,7 @@ export interface BackendSettings {
   ollama_num_predict: number;
   ollama_keep_alive: string;
   system_prompt: string;
+  bank_instruction?: string;
   whisper_model_size: string;
   piper_nepali_voice: string;
   piper_english_voice: string;
@@ -127,11 +196,27 @@ export interface BackendSettings {
   rag_enabled: boolean;
   rag_default_collection: string;
   rag_fallback_to_ollama: boolean;
+  rag_mode: string;
+  kb_chromadb_path?: string;
+  kb_embedding_provider: string;
+  kb_embedding_model: string;
+  kb_embedding_model_st: string;
+  kb_chunk_size: number;
+  kb_chunk_overlap: number;
+  kb_max_results: number;
+  kb_similarity_threshold: number;
+  kb_search_mode?: string;
+  kb_chunk_strategy?: string;
+  kb_reranking_enabled?: boolean;
+  kb_reranking_model?: string;
+  kb_query_analytics?: boolean;
   internet_retrieval_enabled: boolean;
   internet_max_sources: number;
   internet_require_citation: boolean;
   internet_fallback_allowed: boolean;
   llm_provider: string;
+  stt_provider: string;
+  tts_provider: string;
   local_model: string;
   local_fallback_model: string;
   openai_api_key: string;
@@ -146,6 +231,12 @@ export interface BackendSettings {
   force_selected_voice: boolean;
   fallback_allowed: boolean;
   single_tts_voice_model: boolean;
+  openai_tts_voice?: string;
+  ffmpeg_binary?: string;
+  chatterbox_exaggeration?: number;
+  chatterbox_cfg_weight?: number;
+  chatterbox_temperature?: number;
+  chatterbox_repetition_penalty?: number;
 }
 
 export interface VoiceInfo {

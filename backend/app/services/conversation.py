@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from pathlib import Path
@@ -14,6 +15,8 @@ from app.providers.web_retrieval import WebRetrievalProvider
 from app.schemas import ConversationResponse, TimingMetrics
 from app.services.language_router import LanguageRouter
 
+logger = logging.getLogger(__name__)
+
 
 class ConversationService:
     def __init__(
@@ -25,6 +28,7 @@ class ConversationService:
         language_router: LanguageRouter,
         web_retrieval_provider: WebRetrievalProvider,
         audio_base_url: str = "/audio",
+        kb_service=None,
     ) -> None:
         self.stt_provider = stt_provider
         self.llm_provider = llm_provider
@@ -34,6 +38,7 @@ class ConversationService:
         self.web_retrieval_provider = web_retrieval_provider
         self.audio_base_url = audio_base_url.rstrip("/")
         self.settings = openwebui_llm_provider.settings
+        self.kb_service = kb_service
 
     def handle_audio(
         self,
@@ -43,9 +48,12 @@ class ConversationService:
         use_internet: bool = False,
         llm_provider_id: str | None = None,
         session_id: str | None = None,
+        stt_provider_id: str | None = None,
+        stt_language: str | None = None,
     ) -> ConversationResponse:
         started = time.perf_counter()
-        stt_result = self.stt_provider.transcribe_file(audio_path)
+        stt_result = self.stt_provider.transcribe_file(audio_path, provider_name=stt_provider_id, language=stt_language)
+
         transcript_ms = stt_result.duration_ms
         return self._complete_turn(
             text=stt_result.text,
@@ -58,6 +66,7 @@ class ConversationService:
             use_internet=use_internet,
             llm_provider_id=llm_provider_id,
             session_id=session_id,
+            stt_provider_id=stt_provider_id,
         )
 
     def handle_text(
@@ -68,6 +77,7 @@ class ConversationService:
         use_internet: bool = False,
         llm_provider_id: str | None = None,
         session_id: str | None = None,
+        stt_provider_id: str | None = None,
     ) -> ConversationResponse:
         started = time.perf_counter()
         return self._complete_turn(
@@ -79,7 +89,9 @@ class ConversationService:
             use_internet=use_internet,
             llm_provider_id=llm_provider_id,
             session_id=session_id,
+            stt_provider_id=stt_provider_id,
         )
+
 
     def _instantiate_provider(self, provider_id: str) -> Any:
         from app.providers.llm_ollama import OllamaLLMProvider
@@ -114,6 +126,105 @@ class ConversationService:
                 system_prompt=self.settings.system_prompt,
             )
 
+    def _effective_system_prompt(self, language_code: str | None = None, modality: str = "text") -> str:
+        base = self.settings.system_prompt
+        instruction = (getattr(self.settings, "bank_instruction", "") or "").strip()
+        language_instruction = self._language_instruction(language_code, modality)
+        sections = []
+        if instruction:
+            sections.append(f"[ADMIN INSTRUCTION - follow strictly]\n{instruction}")
+        sections.append(f"[LANGUAGE ROUTING]\n{language_instruction}")
+        sections.append(f"[ASSISTANT INSTRUCTION]\n{base}")
+        return "\n\n".join(sections)
+
+    def _language_instruction(self, language_code: str | None, modality: str) -> str:
+        code = language_code or "unknown"
+        if code == "ne":
+            return (
+                f"Input mode: {modality}. Detected user language: Nepali. "
+                "You MUST respond ONLY in Nepali. Do not use any other language or script."
+            )
+        if code == "en":
+            return (
+                f"Input mode: {modality}. Detected user language: English. "
+                "You MUST respond ONLY in English. Do not use any other language or script."
+            )
+        if code == "mixed":
+            return (
+                f"Input mode: {modality}. Detected user language: mixed Nepali-English. "
+                "Respond in natural mixed Nepali-English (Romanized or Devanagari as the user did). "
+                "Never use any third language."
+            )
+        # unknown: keep it bilingual but still constrained to the two allowed languages.
+        return (
+            f"Input mode: {modality}. Detected user language: unknown (assume Nepali/English context). "
+            "Respond only in English or Nepali, matching the user's language. "
+            "Do not use any other language or script."
+        )
+
+    def _retrieve_kb_context(self, query: str, knowledge_id: str | None = None) -> tuple[str, str | None, str | None]:
+        # RAG-first: the banking assistant grounds EVERY turn (text + voice) in the
+        # local Nabil Bank knowledge base. Retrieval is NOT gated on rag_enabled.
+        # If a specific knowledge_id is selected, search only that collection;
+        # otherwise search across all non-empty collections. If the KB is empty or
+        # retrieval errors, we proceed gracefully with no context.
+        if self.kb_service is None or not query.strip():
+            return "", None, None
+
+        collection_ids: list[str] | None = None
+        rag_collection_id: str | None = None
+        if knowledge_id and knowledge_id != "none":
+            collection_ids = [knowledge_id]
+            rag_collection_id = knowledge_id
+        else:
+            try:
+                collections = self.kb_service.list_collections()
+                # Only search collections that actually have indexed chunks.
+                collection_ids = [
+                    collection.id
+                    for collection in collections
+                    if getattr(collection, "chunk_count", 0) > 0
+                ]
+                if not collection_ids:
+                    # Nothing indexed yet — nothing to ground on, proceed without context.
+                    return "", None, None
+                rag_collection_id = ",".join(collection_ids)
+            except Exception as exc:
+                logger.warning("Unable to list KB collections: %s", exc)
+                return "", None, None
+
+        try:
+            context = self.kb_service.build_context(query, collection_ids)
+            return context, "local_kb" if context else None, rag_collection_id if context else None
+        except Exception as exc:
+            logger.warning("Local KB retrieval failed: %s", exc)
+            return "", None, None
+
+    @staticmethod
+    def _build_llm_input(
+        text: str,
+        language_code: str | None,
+        kb_context: str,
+        citations: list[dict[str, str]],
+    ) -> str:
+        parts: list[str] = []
+        if kb_context:
+            parts.append(
+                "Before answering, check this local Nabil Bank knowledge base context. "
+                "Use it when it is relevant. If the context is insufficient, say the knowledge base does not contain enough information.\n\n"
+                f"--- KNOWLEDGE BASE CONTEXT ---\n{kb_context}\n--- END KNOWLEDGE BASE CONTEXT ---"
+            )
+        if citations:
+            context_str = "\n".join(
+                f"- {c['title']}: {c['snippet']} (Source: {c['url']})" for c in citations
+            )
+            parts.append(
+                "Use these web search results only when they are relevant and cite the source URL in the answer.\n\n"
+                f"--- WEB CONTEXT ---\n{context_str}\n--- END WEB CONTEXT ---"
+            )
+        parts.append(f"User question ({language_code or 'unknown'}): {text}")
+        return "\n\n".join(parts)
+
     def _complete_turn(
         self,
         text: str,
@@ -126,6 +237,7 @@ class ConversationService:
         use_internet: bool = False,
         llm_provider_id: str | None = None,
         session_id: str | None = None,
+        stt_provider_id: str | None = None,
     ) -> ConversationResponse:
         input_language = self.language_router.detect(text, whisper_language, whisper_confidence)
         
@@ -146,88 +258,81 @@ class ConversationService:
                 internet_used = True
                 citations = search_results
                 
-        # Prep prompt
-        llm_input = text
-        if internet_used and citations:
-            context_str = "\n".join(
-                f"- {c['title']}: {c['snippet']} (Source: {c['url']})" for c in citations
-            )
-            llm_input = (
-                f"Use the following web search results to answer the query if relevant:\n"
-                f"{context_str}\n\n"
-                f"Query: {text}"
-            )
+        modality = "voice" if transcript_ms is not None else "text"
+        knowledge_context, rag_path, rag_collection_id = self._retrieve_kb_context(text, knowledge_id)
+        rag_used = bool(knowledge_context)
+        llm_input = self._build_llm_input(text, input_language.language, knowledge_context, citations if internet_used else [])
+        system_prompt = self._effective_system_prompt(input_language.language, modality)
 
         # 2. LLM Provider Routing and Fallbacks
+        is_cloud_stt = (stt_provider_id == "openai") or (not stt_provider_id and getattr(self.settings, "stt_provider", "local") == "openai")
+        
+        is_cloud_voice = False
+        if voice_id:
+            vid = voice_id.lower()
+            if "openai" in vid or vid in ("alloy", "echo", "fable", "onyx", "nova", "shimmer"):
+                is_cloud_voice = True
+
         target_provider = llm_provider_id or self.settings.llm_provider or "local"
-        if target_provider == "auto":
-            # Auto defaults to local first
-            actual_provider = "local"
+        if (is_cloud_stt or is_cloud_voice) and target_provider in ("local", "auto"):
+            actual_provider = "openai"
         else:
-            actual_provider = target_provider
+            if target_provider == "auto":
+                actual_provider = "local"
+            else:
+                actual_provider = target_provider
+
 
         if actual_provider == "local":
             provider_instance = self.llm_provider
         else:
             provider_instance = self._instantiate_provider(actual_provider)
         
-        rag_used = False
         rag_fallback_used = False
         fallback_used = False
         fallback_reason = None
-        rag_path = None
         llm_result = None
 
-        if knowledge_id and knowledge_id != "none":
-            rag_used = True
-            if actual_provider == "local":
-                rag_path = "local_openwebui"
-                try:
-                    llm_result = self.openwebui_llm_provider.chat(llm_input, collection_id=knowledge_id)
-                except Exception as e:
-                    if self.settings.rag_fallback_to_ollama:
-                        rag_fallback_used = True
-                        fallback_reason = f"Local RAG failed: {e}. Falling back to direct Ollama."
-                        llm_result = provider_instance.chat(llm_input, system_prompt=self.settings.system_prompt)
-                    else:
-                        raise
+        try:
+            llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
+        except Exception as e:
+            if actual_provider in ("openai", "gemini") and self.settings.cloud_fallback_to_local:
+                fallback_used = True
+                fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local Ollama."
+                actual_provider = "local"
+                provider_instance = self.llm_provider
+                llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
+            elif actual_provider == "local" and knowledge_id and knowledge_id != "none" and self.settings.rag_fallback_to_ollama:
+                rag_fallback_used = True
+                fallback_reason = f"Local RAG prompt failed: {e}. Retrying direct local chat."
+                direct_input = self._build_llm_input(text, input_language.language, "", citations if internet_used else [])
+                llm_result = provider_instance.chat(direct_input, system_prompt=system_prompt)
             else:
-                # Cloud provider uses direct chat as RAG context adapter is not yet integrated
-                rag_path = "cloud_direct_chat"
-                try:
-                    llm_result = provider_instance.chat(llm_input, system_prompt=self.settings.system_prompt)
-                except Exception as e:
-                    if self.settings.cloud_fallback_to_local:
-                        fallback_used = True
-                        fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local RAG."
-                        actual_provider = "local"
-                        local_provider = self.llm_provider
-                        rag_path = "local_openwebui"
-                        try:
-                            llm_result = self.openwebui_llm_provider.chat(llm_input, collection_id=knowledge_id)
-                        except Exception as local_rag_err:
-                            if self.settings.rag_fallback_to_ollama:
-                                rag_fallback_used = True
-                                llm_result = local_provider.chat(llm_input, system_prompt=self.settings.system_prompt)
-                            else:
-                                raise local_rag_err
-                    else:
-                        raise
-        else:
-            # Direct chat without RAG
-            try:
-                llm_result = provider_instance.chat(llm_input, system_prompt=self.settings.system_prompt)
-            except Exception as e:
-                if actual_provider in ("openai", "gemini") and self.settings.cloud_fallback_to_local:
-                    fallback_used = True
-                    fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local Ollama."
-                    actual_provider = "local"
-                    local_provider = self.llm_provider
-                    llm_result = local_provider.chat(llm_input, system_prompt=self.settings.system_prompt)
-                else:
-                    raise
+                raise
 
         response_language = self.language_router.detect(llm_result.text)
+
+        # 2.1 Translations — each call is a full extra LLM round-trip, so skip them in
+        # low-latency mode to keep chat fast. They return when low_latency_mode is off.
+        transcript_translation = None
+        response_translation = None
+        if not getattr(self.settings, "low_latency_mode", False):
+            input_lang_code = input_language.language
+            if input_lang_code == "ne":
+                transcript_translation = self._translate_via_llm(text, "Nepali", "English", provider_instance)
+            elif input_lang_code == "en":
+                transcript_translation = self._translate_via_llm(text, "English", "Nepali", provider_instance)
+            elif input_lang_code == "mixed":
+                transcript_translation = self._translate_via_llm(text, "Nepali/English mixed", "English", provider_instance)
+
+            resp_lang_code = response_language.language
+            if resp_lang_code == "ne":
+                response_translation = self._translate_via_llm(llm_result.text, "Nepali", "English", provider_instance)
+            elif resp_lang_code == "en":
+                response_translation = self._translate_via_llm(llm_result.text, "English", "Nepali", provider_instance)
+            elif resp_lang_code == "mixed":
+                response_translation = self._translate_via_llm(llm_result.text, "Nepali/English mixed", "English", provider_instance)
+
         parts = [
             TTSPart(text=chunk, language=language)
             for chunk, language in self.language_router.split_for_tts(llm_result.text)
@@ -269,9 +374,11 @@ class ConversationService:
             "generated_audio_path": tts_result.generated_audio_path,
             "llm_model": llm_result.model,
             "llm_provider": actual_provider,
-            "rag_collection_id": knowledge_id if rag_used else None,
+            "rag_collection_id": rag_collection_id if rag_used else None,
             "rag_path": rag_path,
             "internet_used": internet_used,
+            "transcript_translation": transcript_translation,
+            "response_translation": response_translation,
         }
         
         # Write sidecar to disk next to the audio file if keeping turn audio
@@ -290,6 +397,8 @@ class ConversationService:
             id=turn_id,
             transcript=text,
             response=llm_result.text,
+            transcript_translation=transcript_translation,
+            response_translation=response_translation,
             input_language=input_language.language,
             response_language=response_language.language,
             audio_url=f"{self.audio_base_url}/{tts_result.audio_path.name}",
@@ -305,7 +414,7 @@ class ConversationService:
                 total_turn_ms=total_ms,
             ),
             rag_used=rag_used,
-            rag_collection_id=knowledge_id if rag_used else None,
+            rag_collection_id=rag_collection_id if rag_used else None,
             rag_fallback_used=combined_fallback,
             internet_used=internet_used,
             citations=citations,
@@ -326,6 +435,7 @@ class ConversationService:
         self._save_chat_turn(response_obj, session_id)
         return response_obj
 
+
     def _save_chat_turn(self, turn: ConversationResponse, session_id: str | None) -> None:
         from app.database import get_db_connection
         import json
@@ -336,12 +446,12 @@ class ConversationService:
             conn.execute(
                 """
                 INSERT INTO chat_turns (
-                    id, session_id, timestamp, transcript, response, input_language, response_language,
+                    id, session_id, timestamp, transcript, response, transcript_translation, response_translation, input_language, response_language,
                     audio_url, user_audio_url, tts_route, timings, rag_used, rag_collection_id,
                     rag_fallback_used, internet_used, citations, voice_id, requested_voice_id,
                     requested_voice_name, actual_voice_id, actual_voice_name, actual_engine,
                     actual_model_path, fallback_used, fallback_reason, llm_provider, rag_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     turn.id,
@@ -349,6 +459,8 @@ class ConversationService:
                     timestamp,
                     turn.transcript,
                     turn.response,
+                    turn.transcript_translation,
+                    turn.response_translation,
                     turn.input_language,
                     turn.response_language,
                     turn.audio_url,
@@ -380,6 +492,7 @@ class ConversationService:
         finally:
             conn.close()
 
+
     def _record_usage_event(self, sidecar: dict[str, Any]) -> None:
         from app.database import get_db_connection
         import json
@@ -395,3 +508,19 @@ class ConversationService:
             pass
         finally:
             conn.close()
+
+    def _translate_via_llm(self, text: str, source_lang: str, target_lang: str, provider_instance: Any) -> str:
+        if not text or not text.strip():
+            return ""
+        prompt = (
+            f"You are a professional, bilingual translator. Translate the following text from {source_lang} to {target_lang}. "
+            f"Provide only the translation, with no explanation, introduction, or formatting. Keep the natural tone and style."
+        )
+        try:
+            res = provider_instance.chat(text.strip(), system_prompt=prompt, options={"temperature": 0.1, "max_tokens": 250})
+            return res.text.strip()
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Translation failed: %s", e)
+            return ""
+

@@ -99,6 +99,34 @@ class ProvidersTest(unittest.TestCase):
             self.assertEqual(result.actual_tts_engine, "openai")
             self.assertEqual(result.requested_voice_name, "OpenAI Alloy")
 
+    def test_openai_tts_retry_on_ssl_timeout(self) -> None:
+        import ssl
+        mock_settings = MagicMock()
+        mock_settings.openai_api_key = "fake_key"
+        
+        fake_wav_data = b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x80\x3e\x00\x00\x00\x7d\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00"
+        
+        call_count = 0
+        def mock_read(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ssl.SSLError("The read operation timed out")
+            return fake_wav_data
+
+        mock_response = MagicMock()
+        mock_response.__enter__.return_value.read.side_effect = mock_read
+        
+        with tempfile.TemporaryDirectory() as tmp:
+            provider = OpenAITTSProvider(mock_settings, Path(tmp))
+            with patch("urllib.request.urlopen", return_value=mock_response):
+                with patch("time.sleep") as mock_sleep:
+                    result = provider.synthesize([TTSPart("Hello", "en")], voice_id="openai-alloy")
+                
+            self.assertTrue(result.audio_path.exists())
+            self.assertEqual(call_count, 2)  # First call timed out, second succeeded
+            mock_sleep.assert_called_once()
+
     def test_tts_router_delegates(self) -> None:
         mock_piper = MagicMock()
         mock_openai = MagicMock()
@@ -116,6 +144,59 @@ class ProvidersTest(unittest.TestCase):
         router.synthesize(parts, voice_id="ne_NP-chitwan-medium")
         mock_piper.synthesize.assert_called_once_with(parts, voice_id="ne_NP-chitwan-medium", fallback_allowed=True)
         mock_openai.synthesize.assert_not_called()
+
+    def test_openai_stt_transcribe_mocked(self) -> None:
+        from app.providers.stt import OpenAISTTProvider
+        
+        get_key = lambda: "fake_openai_key"
+        
+        mock_response = MagicMock()
+        mock_response.__enter__.return_value.read.return_value = b'{"text": "Hello world", "language": "en"}'
+        
+        with tempfile.TemporaryDirectory() as tmp:
+            dummy_file = Path(tmp) / "audio.wav"
+            dummy_file.write_bytes(b"dummy wav data")
+            
+            provider = OpenAISTTProvider(get_key)
+            with patch("urllib.request.urlopen", return_value=mock_response):
+                result = provider.transcribe_file(dummy_file)
+                
+            self.assertEqual(result.text, "Hello world")
+            self.assertEqual(result.language, "en")
+            self.assertEqual(result.confidence, 1.0)
+
+    def test_stt_router_delegates(self) -> None:
+        from app.providers.stt import STTRouter
+        from unittest.mock import PropertyMock
+        
+        mock_local = MagicMock()
+        mock_openai = MagicMock()
+        
+        mock_settings = MagicMock()
+        mock_settings.stt_provider = "local"
+        
+        router = STTRouter(mock_settings)
+        
+        with patch.object(STTRouter, "local_provider", new_callable=PropertyMock, return_value=mock_local), \
+             patch.object(STTRouter, "openai_provider", new_callable=PropertyMock, return_value=mock_openai):
+            
+            with tempfile.TemporaryDirectory() as tmp:
+                dummy_path = Path(tmp) / "dummy.wav"
+                dummy_path.write_bytes(b"dummy wav content")
+                
+                # Test routing to local
+                router.transcribe_file(dummy_path)
+                mock_local.transcribe_file.assert_called_once_with(dummy_path, language=None)
+                mock_openai.transcribe_file.assert_not_called()
+                
+                # Test routing to openai
+                mock_local.reset_mock()
+                mock_openai.reset_mock()
+                mock_settings.stt_provider = "openai"
+                
+                router.transcribe_file(dummy_path)
+                mock_openai.transcribe_file.assert_called_once_with(dummy_path, language=None)
+                mock_local.transcribe_file.assert_not_called()
 
 
 def _write_tiny_wav(path: Path) -> None:

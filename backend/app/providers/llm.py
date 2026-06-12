@@ -47,19 +47,21 @@ class OllamaLLMProvider:
         self.keep_alive = keep_alive
         self.system_prompt = system_prompt
 
-    def chat(self, text: str) -> LLMResult:
+    def chat(self, text: str, system_prompt: str | None = None, options: dict | None = None) -> LLMResult:
         started = time.perf_counter()
+        effective_system = system_prompt if system_prompt is not None else self.system_prompt
+        opts = options or {}
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self.system_prompt},
+                {"role": "system", "content": effective_system},
                 {"role": "user", "content": text.strip()},
             ],
             "stream": False,
             "keep_alive": self.keep_alive,
             "options": {
-                "temperature": self.temperature,
-                "num_predict": self.num_predict,
+                "temperature": opts.get("temperature", self.temperature),
+                "num_predict": opts.get("max_tokens", opts.get("num_predict", self.num_predict)),
                 "top_p": 0.9,
             },
         }
@@ -100,6 +102,13 @@ class OllamaLLMProvider:
                     return json.loads(response.read().decode("utf-8"))
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
                 last_exc = exc
+        if isinstance(last_exc, TimeoutError) or (
+            isinstance(last_exc, urllib.error.URLError) and isinstance(getattr(last_exc, "reason", None), TimeoutError)
+        ):
+            raise ProviderUnavailableError(
+                f"Ollama timed out after {self.timeout_seconds:.0f}s on model {self.model}. "
+                "The model may be loading or running on CPU — increase the timeout or use a smaller model."
+            ) from last_exc
         raise ProviderUnavailableError(
             f"Ollama is not running. Start Ollama, then run: ollama pull {self.model}"
         ) from last_exc

@@ -9,6 +9,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 def _bool_env(name: str, default: bool) -> bool:
     raw = os.getenv(name)
@@ -22,6 +24,9 @@ def _csv_env(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     if not raw:
         return default
     return tuple(item.strip() for item in raw.split(",") if item.strip())
+
+
+SECRET_KEYS = {"openai_api_key", "gemini_api_key", "open_webui_api_key", "elevenlabs_api_key"}
 
 
 @dataclass(slots=True)
@@ -39,9 +44,11 @@ class Settings:
     ollama_timeout_seconds: float = 60
     ollama_retries: int = 1
     system_prompt: str = (
-        "You are SwarLocal, a helpful Nepali-English voice agent. Reply naturally in the user’s language. "
-        "If the user mixes Nepali and English, reply naturally in mixed Nepali-English. Keep spoken answers concise. "
-        "Use selected knowledge when available. Do not invent facts."
+        "You are Nabil Voice AI, a helpful Nepali-English banking assistant for Nabil Bank. "
+        "Reply naturally in the user's detected language: English, Nepali, or mixed Nepali-English only. "
+        "Before answering, use the provided knowledge base context when it is available. "
+        "If the knowledge base does not contain the answer, say that clearly and avoid inventing facts. "
+        "Keep spoken answers concise and practical."
     )
     whisper_model_size: str = "small"
     whisper_device: str = "auto"
@@ -63,25 +70,49 @@ class Settings:
     rag_enabled: bool = False
     rag_default_collection: str = ""
     rag_fallback_to_ollama: bool = True
+    # Local knowledge base (ChromaDB-backed)
+    rag_mode: str = "local"  # "local" | "openwebui"
+    kb_chromadb_path: str = ".local/chromadb"
+    kb_embedding_provider: str = "auto"  # "auto" (OpenAI-first, else sentence-transformers) | "ollama" | "sentence-transformers" | "openai"
+    kb_embedding_model: str = "nomic-embed-text"  # ollama model
+    kb_embedding_model_st: str = "all-MiniLM-L6-v2"  # sentence-transformers model
+    kb_chunk_size: int = 512
+    kb_chunk_overlap: int = 50
+    kb_max_results: int = 5
+    kb_similarity_threshold: float = 0.3
+    kb_search_mode: str = "hybrid"          # semantic | keyword | hybrid
+    kb_chunk_strategy: str = "sentence"     # sentence | word | paragraph
+    kb_reranking_enabled: bool = False
+    kb_reranking_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    kb_query_analytics: bool = True
     internet_retrieval_enabled: bool = False
     internet_max_sources: int = 5
     internet_require_citation: bool = True
     internet_fallback_allowed: bool = False
-    llm_provider: str = "local"
-    local_model: str = "qwen2.5:7b"
-    local_fallback_model: str = "gemma3:4b"
+    ffmpeg_binary: str = ""  # Empty = auto-detect; set to full path to override
+    llm_provider: str = "openai"
+    stt_provider: str = "openai"
+    tts_provider: str = "openai"
+    local_model: str = "llama3:latest"
+    local_fallback_model: str = "llama3:latest"
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-1.5-flash"
     elevenlabs_api_key: str = ""
-    cloud_fallback_to_local: bool = True
+    cloud_fallback_to_local: bool = False
     cloud_timeout_seconds: float = 30.0
     cloud_temperature: float = 0.35
     cloud_max_tokens: int = 180
     force_selected_voice: bool = False
     fallback_allowed: bool = True
     single_tts_voice_model: bool = True
+    openai_tts_voice: str = "alloy"
+    bank_instruction: str = ""
+    chatterbox_exaggeration: float = 0.5
+    chatterbox_cfg_weight: float = 0.5
+    chatterbox_temperature: float = 0.8
+    chatterbox_repetition_penalty: float = 1.2
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -120,11 +151,28 @@ class Settings:
             rag_enabled=_bool_env("RAG_ENABLED", defaults.rag_enabled),
             rag_default_collection=os.getenv("RAG_DEFAULT_COLLECTION", defaults.rag_default_collection),
             rag_fallback_to_ollama=_bool_env("RAG_FALLBACK_TO_OLLAMA", defaults.rag_fallback_to_ollama),
+            rag_mode=os.getenv("RAG_MODE", defaults.rag_mode),
+            kb_chromadb_path=os.getenv("KB_CHROMADB_PATH", defaults.kb_chromadb_path),
+            kb_embedding_provider=os.getenv("KB_EMBEDDING_PROVIDER", defaults.kb_embedding_provider),
+            kb_embedding_model=os.getenv("KB_EMBEDDING_MODEL", defaults.kb_embedding_model),
+            kb_embedding_model_st=os.getenv("KB_EMBEDDING_MODEL_ST", defaults.kb_embedding_model_st),
+            kb_chunk_size=int(os.getenv("KB_CHUNK_SIZE", str(defaults.kb_chunk_size))),
+            kb_chunk_overlap=int(os.getenv("KB_CHUNK_OVERLAP", str(defaults.kb_chunk_overlap))),
+            kb_max_results=int(os.getenv("KB_MAX_RESULTS", str(defaults.kb_max_results))),
+            kb_similarity_threshold=float(os.getenv("KB_SIMILARITY_THRESHOLD", str(defaults.kb_similarity_threshold))),
+            kb_search_mode=os.getenv("KB_SEARCH_MODE", defaults.kb_search_mode),
+            kb_chunk_strategy=os.getenv("KB_CHUNK_STRATEGY", defaults.kb_chunk_strategy),
+            kb_reranking_enabled=_bool_env("KB_RERANKING_ENABLED", defaults.kb_reranking_enabled),
+            kb_reranking_model=os.getenv("KB_RERANKING_MODEL", defaults.kb_reranking_model),
+            kb_query_analytics=_bool_env("KB_QUERY_ANALYTICS", defaults.kb_query_analytics),
             internet_retrieval_enabled=_bool_env("INTERNET_RETRIEVAL_ENABLED", defaults.internet_retrieval_enabled),
             internet_max_sources=int(os.getenv("INTERNET_MAX_SOURCES", str(defaults.internet_max_sources))),
             internet_require_citation=_bool_env("INTERNET_REQUIRE_CITATION", defaults.internet_require_citation),
             internet_fallback_allowed=_bool_env("INTERNET_FALLBACK_ALLOWED", defaults.internet_fallback_allowed),
+            ffmpeg_binary=os.getenv("FFMPEG_BINARY", defaults.ffmpeg_binary),
             llm_provider=os.getenv("LLM_PROVIDER", defaults.llm_provider),
+            stt_provider=os.getenv("STT_PROVIDER", defaults.stt_provider),
+            tts_provider=os.getenv("TTS_PROVIDER", defaults.tts_provider),
             local_model=os.getenv("LOCAL_MODEL", defaults.local_model),
             local_fallback_model=os.getenv("LOCAL_FALLBACK_MODEL", defaults.local_fallback_model),
             openai_api_key=os.getenv("OPENAI_API_KEY", defaults.openai_api_key),
@@ -138,16 +186,35 @@ class Settings:
             cloud_max_tokens=int(os.getenv("CLOUD_MAX_TOKENS", str(defaults.cloud_max_tokens))),
             force_selected_voice=_bool_env("FORCE_SELECTED_VOICE", defaults.force_selected_voice),
             fallback_allowed=_bool_env("FALLBACK_ALLOWED", defaults.fallback_allowed),
-            single_tts_voice_model=_bool_env("SINGLE_TTS_VOICE_MODEL", defaults.single_tts_voice_model),
+            openai_tts_voice=os.getenv("OPENAI_TTS_VOICE", defaults.openai_tts_voice),
+            bank_instruction=os.getenv("BANK_INSTRUCTION", defaults.bank_instruction),
+            chatterbox_exaggeration=float(os.getenv("CHATTERBOX_EXAGGERATION", str(defaults.chatterbox_exaggeration))),
+            chatterbox_cfg_weight=float(os.getenv("CHATTERBOX_CFG_WEIGHT", str(defaults.chatterbox_cfg_weight))),
+            chatterbox_temperature=float(os.getenv("CHATTERBOX_TEMPERATURE", str(defaults.chatterbox_temperature))),
+            chatterbox_repetition_penalty=float(os.getenv("CHATTERBOX_REPETITION_PENALTY", str(defaults.chatterbox_repetition_penalty))),
         )
         settings._load_runtime_overrides()
         settings.ensure_dirs()
         return settings
 
     def ensure_dirs(self) -> None:
+        self._normalize_paths()
         self.piper_audio_cache_dir.mkdir(parents=True, exist_ok=True)
         self.audio_work_dir.mkdir(parents=True, exist_ok=True)
         self.runtime_settings_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def _normalize_paths(self) -> None:
+        for attr in (
+            "piper_nepali_voice",
+            "piper_english_voice",
+            "piper_audio_cache_dir",
+            "audio_work_dir",
+            "runtime_settings_path",
+        ):
+            path = Path(getattr(self, attr)).expanduser()
+            if not path.is_absolute():
+                path = REPO_ROOT / path
+            setattr(self, attr, path)
 
     def public_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -172,6 +239,7 @@ class Settings:
 
     def update_from_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
         allowed = {
+            "ffmpeg_binary",
             "ollama_model",
             "ollama_base_url",
             "ollama_temperature",
@@ -190,11 +258,27 @@ class Settings:
             "rag_enabled",
             "rag_default_collection",
             "rag_fallback_to_ollama",
+            "rag_mode",
+            "kb_chromadb_path",
+            "kb_embedding_provider",
+            "kb_embedding_model",
+            "kb_embedding_model_st",
+            "kb_chunk_size",
+            "kb_chunk_overlap",
+            "kb_max_results",
+            "kb_similarity_threshold",
+            "kb_search_mode",
+            "kb_chunk_strategy",
+            "kb_reranking_enabled",
+            "kb_reranking_model",
+            "kb_query_analytics",
             "internet_retrieval_enabled",
             "internet_max_sources",
             "internet_require_citation",
             "internet_fallback_allowed",
             "llm_provider",
+            "stt_provider",
+            "tts_provider",
             "local_model",
             "local_fallback_model",
             "openai_api_key",
@@ -208,23 +292,48 @@ class Settings:
             "force_selected_voice",
             "fallback_allowed",
             "single_tts_voice_model",
+            "openai_tts_voice",
             "elevenlabs_api_key",
+            "bank_instruction",
+            "chatterbox_exaggeration",
+            "chatterbox_cfg_weight",
+            "chatterbox_temperature",
+            "chatterbox_repetition_penalty",
         }
         changed: dict[str, Any] = {}
         for key, value in payload.items():
-            if key not in allowed or value in (None, ""):
+            if key not in allowed or value is None or (value == "" and key != "bank_instruction"):
                 continue
-            if key in ("openai_api_key", "gemini_api_key", "open_webui_api_key", "elevenlabs_api_key") and "..." in str(value):
+            if key in ("openai_api_key", "gemini_api_key", "open_webui_api_key", "elevenlabs_api_key") and ("..." in str(value) or "…" in str(value) or "****" in str(value)):
                 continue
-            if key.startswith("piper_"):
+            if key in {"piper_nepali_voice", "piper_english_voice"}:
                 value = Path(str(value)).expanduser()
             setattr(self, key, value)
             changed[key] = str(value) if isinstance(value, Path) else value
         if changed:
+            self._normalize_paths()
             self._write_runtime_overrides()
         return changed
 
     def _load_runtime_overrides(self) -> None:
+        # 1. Load from MySQL (if available) — takes priority
+        try:
+            from app.db_settings import load_settings as mysql_load
+            mysql_payload = mysql_load()
+            if mysql_payload:
+                for key, value in mysql_payload.items():
+                    if not hasattr(self, key):
+                        continue
+                    if key in SECRET_KEYS and not value and getattr(self, key, ""):
+                        continue
+                    if key in {"piper_nepali_voice", "piper_english_voice"} and isinstance(value, str):
+                        value = Path(value).expanduser()
+                    setattr(self, key, value)
+                return  # MySQL loaded — skip JSON file
+        except Exception:
+            pass
+
+        # 2. Fallback: load from local JSON file
         if not self.runtime_settings_path.exists():
             return
         try:
@@ -234,12 +343,15 @@ class Settings:
         for key, value in payload.items():
             if not hasattr(self, key):
                 continue
-            if key.startswith("piper_"):
-                value = Path(str(value)).expanduser()
+            if key in SECRET_KEYS and not value and getattr(self, key, ""):
+                continue
+            if key in {"piper_nepali_voice", "piper_english_voice"} and isinstance(value, str):
+                value = Path(value).expanduser()
             setattr(self, key, value)
 
     def _write_runtime_overrides(self) -> None:
         payload = {
+            "ffmpeg_binary": self.ffmpeg_binary,
             "ollama_model": self.ollama_model,
             "ollama_base_url": self.ollama_base_url,
             "ollama_temperature": self.ollama_temperature,
@@ -258,11 +370,27 @@ class Settings:
             "rag_enabled": self.rag_enabled,
             "rag_default_collection": self.rag_default_collection,
             "rag_fallback_to_ollama": self.rag_fallback_to_ollama,
+            "rag_mode": self.rag_mode,
+            "kb_chromadb_path": self.kb_chromadb_path,
+            "kb_embedding_provider": self.kb_embedding_provider,
+            "kb_embedding_model": self.kb_embedding_model,
+            "kb_embedding_model_st": self.kb_embedding_model_st,
+            "kb_chunk_size": self.kb_chunk_size,
+            "kb_chunk_overlap": self.kb_chunk_overlap,
+            "kb_max_results": self.kb_max_results,
+            "kb_similarity_threshold": self.kb_similarity_threshold,
+            "kb_search_mode": self.kb_search_mode,
+            "kb_chunk_strategy": self.kb_chunk_strategy,
+            "kb_reranking_enabled": self.kb_reranking_enabled,
+            "kb_reranking_model": self.kb_reranking_model,
+            "kb_query_analytics": self.kb_query_analytics,
             "internet_retrieval_enabled": self.internet_retrieval_enabled,
             "internet_max_sources": self.internet_max_sources,
             "internet_require_citation": self.internet_require_citation,
             "internet_fallback_allowed": self.internet_fallback_allowed,
             "llm_provider": self.llm_provider,
+            "stt_provider": self.stt_provider,
+            "tts_provider": self.tts_provider,
             "local_model": self.local_model,
             "local_fallback_model": self.local_fallback_model,
             "openai_api_key": self.openai_api_key,
@@ -277,5 +405,18 @@ class Settings:
             "force_selected_voice": self.force_selected_voice,
             "fallback_allowed": self.fallback_allowed,
             "single_tts_voice_model": self.single_tts_voice_model,
+            "openai_tts_voice": self.openai_tts_voice,
+            "bank_instruction": self.bank_instruction,
+            "chatterbox_exaggeration": self.chatterbox_exaggeration,
+            "chatterbox_cfg_weight": self.chatterbox_cfg_weight,
+            "chatterbox_temperature": self.chatterbox_temperature,
+            "chatterbox_repetition_penalty": self.chatterbox_repetition_penalty,
         }
+        # Write to local JSON (always reliable fallback)
         self.runtime_settings_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        # Also persist to MySQL (best-effort, non-blocking)
+        try:
+            from app.db_settings import save_settings as mysql_save
+            mysql_save(payload)
+        except Exception:
+            pass

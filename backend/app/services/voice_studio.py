@@ -18,14 +18,36 @@ from app.database import get_db_connection
 from app.services.audio_validation import AudioValidator, AudioValidationError
 
 VOICE_STUDIO_PROMPTS = [
-    {"id": "ne_001", "language": "ne", "category": "general", "text": "नमस्ते, आज म मेरो आवाजको नमूना रेकर्ड गर्दैछु।"},
-    {"id": "ne_002", "language": "ne", "category": "banking", "text": "तपाईंको बैंक खातामा रकम सफलतापूर्वक जम्मा भएको छ।"},
-    {"id": "ne_003", "language": "ne", "category": "support", "text": "कृपया मलाई यो समस्या समाधान गर्न मद्दत गर्नुहोस्।"},
-    {"id": "en_001", "language": "en", "category": "general", "text": "Hello, this is a clean sample of my speaking voice."},
-    {"id": "en_002", "language": "en", "category": "banking", "text": "Your account balance has been updated successfully."},
-    {"id": "en_003", "language": "en", "category": "support", "text": "How can I assist you with your customer support query today?"},
+    # Nepali prompts — varied pitch, tone, rhythm
+    {"id": "ne_001", "language": "ne", "category": "general",  "text": "नमस्ते, आज म मेरो आवाजको नमूना रेकर्ड गर्दैछु।"},
+    {"id": "ne_002", "language": "ne", "category": "banking",  "text": "तपाईंको बैंक खातामा रकम सफलतापूर्वक जम्मा भएको छ।"},
+    {"id": "ne_003", "language": "ne", "category": "support",  "text": "कृपया मलाई यो समस्या समाधान गर्न मद्दत गर्नुहोस्।"},
+    {"id": "ne_004", "language": "ne", "category": "numbers",  "text": "एक, दुई, तीन, चार, पाँच, छ, सात, आठ, नौ, दश।"},
+    {"id": "ne_005", "language": "ne", "category": "question", "text": "के तपाईंलाई आज कुनै सहायता चाहिएको छ?"},
+    {"id": "ne_006", "language": "ne", "category": "banking",  "text": "बैंकको वित्तीय सेवाहरू र नयाँ सुविधाहरू निकै उपयोगी छन्।"},
+    {"id": "ne_007", "language": "ne", "category": "security", "text": "मेरो व्यक्तिगत विवरण र खाता सुरक्षित राख्न म सधैं सजग छु।"},
+    {"id": "ne_008", "language": "ne", "category": "general",  "text": "नेपालको प्राकृतिक सुन्दरता र संस्कृति विश्वमै अद्वितीय छ।"},
+    {"id": "ne_009", "language": "ne", "category": "support",  "text": "ग्राहक सेवा प्रतिनिधिले मेरो जिज्ञासाबारे राम्रो जानकारी दिनुभयो।"},
+    {"id": "ne_010", "language": "ne", "category": "banking",  "text": "नयाँ प्रविधिको प्रयोगले हाम्रो दैनिक बैंकिङ कार्यलाई झन् सजिलो बनाएको छ।"},
+    # English prompts — phonetically diverse
+    {"id": "en_001", "language": "en", "category": "general",  "text": "Hello, this is a clean sample of my speaking voice."},
+    {"id": "en_002", "language": "en", "category": "banking",  "text": "Your account balance has been updated successfully."},
+    {"id": "en_003", "language": "en", "category": "support",  "text": "How can I assist you with your customer support query today?"},
+    {"id": "en_004", "language": "en", "category": "rainbow",  "text": "The quick brown fox jumps over the lazy dog near the riverbank."},
+    {"id": "en_005", "language": "en", "category": "emotion",  "text": "I am really happy to help you with that right away!"},
+    {"id": "en_006", "language": "en", "category": "numbers",  "text": "One, two, three, four, five, six, seven, eight, nine, ten."},
+    {"id": "en_007", "language": "en", "category": "banking",  "text": "We strive to deliver secure and reliable financial solutions to our customers."},
+    {"id": "en_008", "language": "en", "category": "security", "text": "Could you please verify your identity before we proceed with the account changes?"},
+    {"id": "en_009", "language": "en", "category": "general",  "text": "The weather today is perfect for a short walk in the park near the office."},
+    {"id": "en_010", "language": "en", "category": "general",  "text": "Innovation drives progress, and technology makes our daily tasks much simpler."},
+    {"id": "en_011", "language": "en", "category": "security", "text": "Please make sure to enable two-factor authentication for additional security."},
+    # Mixed Nepali-English prompts
     {"id": "mixed_001", "language": "mixed", "category": "general", "text": "नमस्ते, मलाई banking app मा login गर्न help चाहियो।"},
-    {"id": "mixed_002", "language": "mixed", "category": "support", "text": "मेरो transaction status check गरेर mobile message पठाइदिनुस् न।"}
+    {"id": "mixed_002", "language": "mixed", "category": "support", "text": "मेरो transaction status check गरेर mobile message पठाइदिनुस् न।"},
+    {"id": "mixed_003", "language": "mixed", "category": "general", "text": "Please मलाई यो form fill गर्न सघाउनुस्।"},
+    {"id": "mixed_004", "language": "mixed", "category": "support", "text": "मेरो credit card हरायो, म यसलाई कसरी block गराउन सक्छु?"},
+    {"id": "mixed_005", "language": "mixed", "category": "banking", "text": "यस loan approval process को लागि कति days लाग्छ होला?"},
+    {"id": "mixed_006", "language": "mixed", "category": "security", "text": "तपाईंको online payment security र privacy नीति एकदमै चित्तबुझ्दो छ।"},
 ]
 
 
@@ -145,10 +167,10 @@ class VoiceStudioService:
             conn.close()
             raise ValueError(f"Voice not found: {voice_id}")
             
-        # Check consent first
+        # Ensure consent is signed before recording samples
         if voice["consent_status"] != "completed":
             conn.close()
-            raise AudioValidationError("Recording is blocked: Voice consent is required first.")
+            raise ValueError("Voice consent is required first.")
             
         voice_dir = self.base_dir / voice_id
         raw_dir = voice_dir / "raw"
@@ -234,21 +256,18 @@ class VoiceStudioService:
             if voice["consent_status"] != "completed":
                 raise ValueError("Consent is missing. Cannot publish voice.")
             samples = conn.execute("SELECT * FROM voice_samples WHERE voice_id = ?;", (voice_id,)).fetchall()
-            if len(samples) < 3:
-                raise ValueError("At least 3 clean recordings are required before publishing.")
-                
-            # Quality & similarity checks
-            for sample in samples:
-                if sample["status"] == "reject":
-                    raise ValueError(f"Recording '{sample['prompt_id']}' has been rejected (Quality/Speaker mismatch). Please fix or re-record it.")
-            
-            # Recalculate average quality score dynamically to be self-healing
-            scores = [s["score"] for s in samples if s["score"] is not None]
+            # Only count non-rejected samples toward the minimum
+            good_samples = [s for s in samples if s["status"] != "reject"]
+            if len(good_samples) < 3:
+                raise ValueError(f"At least 3 usable recordings are required (you have {len(good_samples)}). Record more prompts.")
+
+            # Recalculate average quality score using only good samples
+            scores = [s["score"] for s in good_samples if s["score"] is not None]
             avg_score = sum(scores) / len(scores) if scores else 0.0
             conn.execute("UPDATE voices SET quality_score = ? WHERE id = ?;", (avg_score, voice_id))
-            
-            if avg_score < 70.0:
-                raise ValueError(f"Average quality score ({avg_score:.1f}) is below the required 70.0 threshold.")
+
+            if avg_score < 50.0:
+                raise ValueError(f"Average quality score ({avg_score:.1f}) is below 50. Try recording in a quieter place.")
                 
             conn.execute("UPDATE voices SET publish_status = 'published', status = 'ready' WHERE id = ?;", (voice_id,))
             conn.commit()
@@ -343,24 +362,33 @@ class VoiceStudioService:
         
         score = 100
         reasons = []
-        if duration < 1.4:
-            score -= 38
+        if duration < 1.0:
+            score -= 40
             reasons.append("too_short")
-        if duration > 12:
-            score -= 24
+        elif duration < 2.0:
+            score -= 15
+            reasons.append("short")
+        if duration > 18:
+            score -= 20
             reasons.append("too_long")
-        if rms < 0.015:
-            score -= 30
+        if rms < 0.005:
+            score -= 35
+            reasons.append("very_quiet")
+        elif rms < 0.012:
+            score -= 15
             reasons.append("quiet")
-        if clipped_ratio > 0.002:
+        if clipped_ratio > 0.01:
             score -= 35
             reasons.append("clipped")
-        if channels != 1:
+        elif clipped_ratio > 0.003:
             score -= 12
+            reasons.append("slight_clipping")
+        if channels != 1:
+            score -= 8
             reasons.append("not_mono")
-        
+
         score = max(0, min(100, score))
-        verdict = "good" if score >= 82 else "review" if score >= 62 else "reject"
+        verdict = "good" if score >= 65 else "review" if score >= 45 else "reject"
         return {
             "score": score,
             "verdict": verdict,

@@ -39,18 +39,21 @@ class EnvironmentReport:
 
 
 def run_environment_checks(settings: Settings) -> EnvironmentReport:
+    # Determine if local provider is ready (skips cloud as blockers)
+    local_ready = _is_local_ollama_ready(settings)
+    active_provider = getattr(settings, "llm_provider", "local")
+    cloud_is_active = active_provider in ("openai", "gemini")
+
     checks = [
         _macos_check(),
         _architecture_check(),
         _python_check(),
         _node_check(),
         _npm_check(),
-        _ffmpeg_check(),
-        _ollama_binary_check(),
+        _ffmpeg_check(settings),
+        _ollama_binary_check(settings),
         _ollama_api_check(settings),
         _ollama_model_check(settings),
-        _installed_model_check(settings, "qwen2.5:7b", critical=False),
-        _installed_model_check(settings, "gemma3:4b", critical=False),
         _open_webui_check(settings),
         _open_webui_auth_check(settings),
         _piper_check(settings),
@@ -62,10 +65,11 @@ def run_environment_checks(settings: Settings) -> EnvironmentReport:
         _disk_space_check(Path.cwd()),
         _database_check(settings),
         _local_ai_ready_check(settings),
-        _openai_configured_check(settings),
-        _openai_tested_check(settings),
-        _gemini_configured_check(settings),
-        _gemini_tested_check(settings),
+        # Cloud providers: only critical if that provider is actively selected
+        _openai_configured_check(settings, critical=cloud_is_active and active_provider == "openai"),
+        _openai_tested_check(settings, critical=False),
+        _gemini_configured_check(settings, critical=cloud_is_active and active_provider == "gemini"),
+        _gemini_tested_check(settings, critical=False),
         _active_provider_ready_check(settings),
         _cloud_fallback_check(settings),
     ]
@@ -83,21 +87,23 @@ def _run_version(command: list[str]) -> tuple[bool, str]:
 
 
 def _macos_check() -> EnvironmentCheck:
-    version = platform.mac_ver()[0]
-    ok = platform.system() == "Darwin"
+    system = platform.system()
+    version = platform.mac_ver()[0] if system == "Darwin" else platform.release()
+    ok = system in ("Darwin", "Windows", "Linux")
+    detail = f"macOS {version}" if system == "Darwin" else f"Detected {system} {version}"
     return EnvironmentCheck(
         "macos",
         ok,
         False,
-        f"macOS {version}" if ok else f"Detected {platform.system()}",
-        "Use macOS for the primary supported development path.",
+        detail,
+        None,  # Windows is fully supported
     )
 
 
 def _architecture_check() -> EnvironmentCheck:
     machine = platform.machine()
-    detail = "Apple Silicon" if machine == "arm64" else f"Intel/other ({machine})"
-    return EnvironmentCheck("architecture", machine in {"arm64", "x86_64"}, False, detail)
+    detail = "Apple Silicon" if machine == "arm64" else f"Windows AMD64" if machine == "AMD64" else f"Intel/other ({machine})"
+    return EnvironmentCheck("architecture", machine in {"arm64", "x86_64", "AMD64"}, False, detail)
 
 
 def _python_check() -> EnvironmentCheck:
@@ -123,26 +129,61 @@ def _npm_check() -> EnvironmentCheck:
     return EnvironmentCheck("npm", ok, True, detail, "Install npm with Node.js.")
 
 
-def _ffmpeg_check() -> EnvironmentCheck:
-    path = shutil.which("ffmpeg")
+def _ffmpeg_fix_command() -> str:
+    """Return OS-appropriate ffmpeg install command."""
+    system = platform.system()
+    if system == "Windows":
+        return (
+            "Windows: winget install ffmpeg  OR  choco install ffmpeg  OR  scoop install ffmpeg  "
+            "OR download from https://github.com/BtbN/FFmpeg-Builds/releases and add to PATH. "
+            "Then set FFMPEG_BINARY in Settings to the full path."
+        )
+    if system == "Darwin":
+        return "macOS: brew install ffmpeg"
+    return "Linux: sudo apt install ffmpeg  OR  sudo dnf install ffmpeg  OR  sudo pacman -S ffmpeg"
+
+
+def _ffmpeg_check(settings: Settings) -> EnvironmentCheck:
+    # Use the same resolution logic as the audio pipeline so diagnostics always match reality
+    from app.services.audio_validation import get_ffmpeg_path
+    path = get_ffmpeg_path()
+    detail = path if path else "ffmpeg not found (static-ffmpeg will auto-download on first voice turn)"
     return EnvironmentCheck(
         "ffmpeg",
         path is not None,
-        True,
-        path or "ffmpeg not found",
-        "Run: brew install ffmpeg",
+        False,  # Non-critical in diagnostics; auto-resolved at runtime via static-ffmpeg
+        detail,
+        _ffmpeg_fix_command() if path is None else None,
     )
 
 
-def _ollama_binary_check() -> EnvironmentCheck:
+def _ollama_binary_check(settings: Settings) -> EnvironmentCheck:
     path = shutil.which("ollama")
+    api_ok = False
+    try:
+        _get_json(f"{settings.ollama_base_url}/api/tags", timeout=1)
+        api_ok = True
+    except Exception:
+        pass
+    ok = (path is not None) or api_ok
+    detail = path or "ollama binary not in PATH (Ollama runs as a service)"
     return EnvironmentCheck(
         "ollama_binary",
-        path is not None,
+        ok,
         False,
-        path or "ollama not found",
-        "Install Ollama, then run: ollama pull qwen3:1.7b",
+        detail,
+        None if ok else "If Ollama API is reachable, this is informational only. To add to PATH: restart terminal after Ollama install.",
     )
+
+
+def _is_local_ollama_ready(settings: Settings) -> bool:
+    """Quick check: is local Ollama API up with the configured model?"""
+    try:
+        payload = _get_json(f"{settings.ollama_base_url}/api/tags", timeout=2)
+        names = {m.get("name") for m in payload.get("models", []) if isinstance(m, dict)}
+        return bool(names & {settings.ollama_model, settings.local_model, "llama3:latest"})
+    except Exception:
+        return False
 
 
 def _ollama_api_check(settings: Settings) -> EnvironmentCheck:
@@ -172,6 +213,17 @@ def _ollama_model_check(settings: Settings) -> EnvironmentCheck:
         )
     names = {model.get("name") for model in payload.get("models", []) if isinstance(model, dict)}
     ok = settings.ollama_model in names
+    if not ok:
+        # Try local_model as fallback check
+        ok = settings.local_model in names
+        if ok:
+            return EnvironmentCheck(
+                "ollama_model",
+                True,
+                False,
+                f"{settings.local_model} installed (active model)",
+                None,
+            )
     return EnvironmentCheck(
         "ollama_model",
         ok,
@@ -181,55 +233,50 @@ def _ollama_model_check(settings: Settings) -> EnvironmentCheck:
     )
 
 
-def _installed_model_check(settings: Settings, model_name: str, critical: bool) -> EnvironmentCheck:
-    try:
-        payload = _get_json(f"{settings.ollama_base_url}/api/tags", timeout=3)
-    except Exception:
-        return EnvironmentCheck(
-            f"ollama_model_{model_name.replace(':', '_')}",
-            False,
-            critical,
-            f"Cannot verify {model_name}; Ollama API is unavailable.",
-            f"Run: ollama pull {model_name}",
-        )
-    names = {model.get("name") for model in payload.get("models", []) if isinstance(model, dict)}
-    ok = model_name in names
-    return EnvironmentCheck(
-        f"ollama_model_{model_name.replace(':', '_')}",
-        ok,
-        critical,
-        f"{model_name} installed" if ok else f"{model_name} not listed by Ollama",
-        f"Run: ollama pull {model_name}",
-    )
-
-
 def _open_webui_check(settings: Settings) -> EnvironmentCheck:
+    # Open WebUI is optional — only needed for RAG
+    rag_enabled = getattr(settings, "rag_enabled", False)
     try:
         payload = _get_json(f"{settings.open_webui_base_url}/api/config", timeout=3)
+        version = payload.get("version", "unknown")
+        return EnvironmentCheck("open_webui", True, False, f"Open WebUI {version} reachable")
     except Exception:
+        detail = f"Open WebUI not reachable at {settings.open_webui_base_url}"
+        if not rag_enabled:
+            detail += " (optional — RAG is disabled)"
         return EnvironmentCheck(
             "open_webui",
+            not rag_enabled,  # OK if RAG not enabled
             False,
-            False,
-            f"Open WebUI is not reachable at {settings.open_webui_base_url}",
-            "Start Open WebUI, then open http://127.0.0.1:8080/.",
+            detail,
+            "Start Open WebUI to enable RAG, or leave disabled if not needed.",
         )
-    version = payload.get("version", "unknown")
-    return EnvironmentCheck("open_webui", bool(payload.get("status")), False, f"Open WebUI {version} reachable")
 
 
 def _open_webui_auth_check(settings: Settings) -> EnvironmentCheck:
+    rag_enabled = getattr(settings, "rag_enabled", False)
+    has_key = bool(settings.open_webui_api_key)
+    if has_key:
+        return EnvironmentCheck("open_webui_auth", True, False, "Open WebUI API key configured")
+    detail = "Open WebUI API key not configured"
+    if not rag_enabled:
+        detail += " (optional — RAG is disabled)"
     return EnvironmentCheck(
         "open_webui_auth",
-        bool(settings.open_webui_api_key),
+        not rag_enabled,  # OK if RAG not enabled
         False,
-        "Open WebUI API key configured" if settings.open_webui_api_key else "Open WebUI API key is not configured",
-        "Create an API key in Open WebUI after local onboarding, then set OPEN_WEBUI_API_KEY.",
+        detail,
+        "Enable RAG in Settings and enter your Open WebUI API key — only needed for document knowledge.",
     )
 
 
 def _piper_check(settings: Settings) -> EnvironmentCheck:
     path = shutil.which(settings.piper_binary)
+    if path is None:
+        # Check absolute path directly
+        p = Path(settings.piper_binary)
+        if p.exists():
+            path = str(p)
     return EnvironmentCheck(
         "piper",
         path is not None,
@@ -292,7 +339,8 @@ def _disk_space_check(path: Path) -> EnvironmentCheck:
 
 
 def _database_check(settings: Settings) -> EnvironmentCheck:
-    db_path = settings.audio_work_dir.parent / "swarlocal.db"
+    from app.database import DB_FILE
+    db_path = DB_FILE
     ok = db_path.exists() and db_path.stat().st_size > 0
     return EnvironmentCheck(
         "commercial_db",
@@ -337,55 +385,74 @@ def _local_ai_ready_check(settings: Settings) -> EnvironmentCheck:
     try:
         payload = _get_json(f"{settings.ollama_base_url}/api/tags", timeout=2)
         names = {model.get("name") for model in payload.get("models", []) if isinstance(model, dict)}
-        ok = settings.local_model in names
-        detail = f"Local Ollama online, model '{settings.local_model}' is installed." if ok else f"Model '{settings.local_model}' not installed in local Ollama."
+        # Accept either the configured model or llama3:latest as valid
+        ok = settings.local_model in names or settings.ollama_model in names
+        if ok:
+            active = settings.local_model if settings.local_model in names else settings.ollama_model
+            detail = f"Local Ollama online, model '{active}' is installed."
+        else:
+            detail = f"Model '{settings.local_model}' not installed in local Ollama."
     except Exception:
         ok = False
         detail = "Local Ollama is offline."
     return EnvironmentCheck("local_ai_ready", ok, False, detail, f"Run: ollama pull {settings.local_model}")
 
 
-def _openai_configured_check(settings: Settings) -> EnvironmentCheck:
-    ok = bool(settings.openai_api_key)
+def _openai_configured_check(settings: Settings, critical: bool = False) -> EnvironmentCheck:
+    has_key = bool(settings.openai_api_key)
+    ok = has_key or not critical
+    detail = "OpenAI API key configured" if has_key else "OpenAI API key not set (optional — local Ollama is active)"
     return EnvironmentCheck(
         "openai_configured",
         ok,
-        False,
-        "OpenAI API key configured" if ok else "OpenAI API key is missing",
-        "Add OPENAI_API_KEY in settings if you want to use OpenAI cloud model."
+        critical,
+        detail,
+        None if ok else "Add OPENAI_API_KEY in Settings only if you want to use OpenAI cloud model."
     )
 
 
-def _openai_tested_check(settings: Settings) -> EnvironmentCheck:
-    ok = PROVIDER_TESTS.get("openai", False)
+def _openai_tested_check(settings: Settings, critical: bool = False) -> EnvironmentCheck:
+    tested = PROVIDER_TESTS.get("openai", False)
+    has_key = bool(settings.openai_api_key)
+    active_provider = getattr(settings, "llm_provider", "local")
+    is_active = active_provider == "openai"
+    ok = tested or not is_active or not has_key
+    detail = "OpenAI connection tested successfully" if tested else "OpenAI connection not tested (optional)"
     return EnvironmentCheck(
         "openai_tested",
         ok,
-        False,
-        "OpenAI connection tested successfully" if ok else "OpenAI connection has not been tested successfully yet.",
-        "Click 'Test Connection' on OpenAI card in settings."
+        critical,
+        detail,
+        None if ok else "Click 'Test Connection' on OpenAI card in Settings if using OpenAI."
     )
 
 
-def _gemini_configured_check(settings: Settings) -> EnvironmentCheck:
-    ok = bool(settings.gemini_api_key)
+def _gemini_configured_check(settings: Settings, critical: bool = False) -> EnvironmentCheck:
+    has_key = bool(settings.gemini_api_key)
+    ok = has_key or not critical
+    detail = "Gemini API key configured" if has_key else "Gemini API key not set (optional — local Ollama is active)"
     return EnvironmentCheck(
         "gemini_configured",
         ok,
-        False,
-        "Gemini API key configured" if ok else "Gemini API key is missing",
-        "Add GEMINI_API_KEY in settings if you want to use Google Gemini cloud model."
+        critical,
+        detail,
+        None if ok else "Add GEMINI_API_KEY in Settings only if you want to use Google Gemini cloud model."
     )
 
 
-def _gemini_tested_check(settings: Settings) -> EnvironmentCheck:
-    ok = PROVIDER_TESTS.get("gemini", False)
+def _gemini_tested_check(settings: Settings, critical: bool = False) -> EnvironmentCheck:
+    tested = PROVIDER_TESTS.get("gemini", False)
+    has_key = bool(settings.gemini_api_key)
+    active_provider = getattr(settings, "llm_provider", "local")
+    is_active = active_provider == "gemini"
+    ok = tested or not is_active or not has_key
+    detail = "Gemini connection tested successfully" if tested else "Gemini connection not tested (optional)"
     return EnvironmentCheck(
         "gemini_tested",
         ok,
-        False,
-        "Gemini connection tested successfully" if ok else "Gemini connection has not been tested successfully yet.",
-        "Click 'Test Connection' on Gemini card in settings."
+        critical,
+        detail,
+        None if ok else "Click 'Test Connection' on Gemini card in Settings if using Gemini."
     )
 
 
@@ -401,8 +468,9 @@ def _active_provider_ready_check(settings: Settings) -> EnvironmentCheck:
         try:
             payload = _get_json(f"{settings.ollama_base_url}/api/tags", timeout=2)
             names = {model.get("name") for model in payload.get("models", []) if isinstance(model, dict)}
-            ok = settings.local_model in names
-            detail = f"Active provider: Local Ollama (model '{settings.local_model}' is ready)" if ok else f"Active provider: Local Ollama (model '{settings.local_model}' missing)"
+            active = settings.local_model if settings.local_model in names else (settings.ollama_model if settings.ollama_model in names else None)
+            ok = active is not None
+            detail = f"Active provider: Local Ollama (model '{active}' is ready)" if ok else f"Active provider: Local Ollama (model '{settings.local_model}' missing)"
         except Exception:
             ok = False
             detail = "Active provider: Local Ollama (Ollama offline)"
@@ -410,7 +478,7 @@ def _active_provider_ready_check(settings: Settings) -> EnvironmentCheck:
     return EnvironmentCheck(
         "active_provider_ready",
         ok,
-        False,
+        True,  # This IS critical — the active provider must work
         detail,
         "Configure the active LLM provider in Settings."
     )
@@ -430,18 +498,14 @@ def _readiness_lines(report: EnvironmentReport) -> list[str]:
 
     categories = {
         "Text chat ready": ok("ollama_api", "ollama_model"),
-        "Voice chat ready": ok("ffmpeg", "ollama_api", "ollama_model", "piper", "piper_nepali_voice", "piper_english_voice", "stt", "voice_websocket_route"),
+        "Voice chat ready": ok("ollama_api", "piper", "piper_nepali_voice", "piper_english_voice", "stt", "voice_websocket_route"),
         "RAG ready": ok("open_webui", "open_webui_auth"),
-        "Voice Studio recording ready": ok("ffmpeg"),
+        "Voice Studio recording ready": ok("piper", "stt"),
         "Piper TTS ready": ok("piper", "piper_nepali_voice", "piper_english_voice"),
-        "Custom voice training ready": ok("ffmpeg"),
+        "Custom voice training ready": ok("piper", "stt"),
         "Commercial deployment ready": ok("commercial_db"),
         "Local AI ready": ok("local_ai_ready"),
-        "OpenAI configured": ok("openai_configured"),
-        "OpenAI connection tested": ok("openai_tested"),
-        "Gemini configured": ok("gemini_configured"),
-        "Gemini connection tested": ok("gemini_tested"),
         "Active provider ready": ok("active_provider_ready"),
-        "Cloud fallback enabled/disabled": ok("cloud_fallback_status"),
+        "Cloud fallback enabled": ok("cloud_fallback_status"),
     }
     return [f"[{'READY' if value else 'BLOCKED'}] {name}" for name, value in categories.items()]

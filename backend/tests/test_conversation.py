@@ -113,7 +113,7 @@ class ConversationServiceTest(unittest.TestCase):
             )
             response = service.handle_text("Hello")
             self.assertEqual(response.input_language, "en")
-            self.assertEqual(response.response, "Reply to Hello")
+            self.assertEqual(response.response, "Reply to User question (en): Hello")
             self.assertEqual(response.audio_url, "/audio/reply.wav")
             self.assertEqual(response.requested_voice_id, None)
             self.assertEqual(response.actual_engine, "piper")

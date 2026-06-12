@@ -110,4 +110,54 @@ class OpenAILLMProvider:
             raise RuntimeError(f"OpenAI connection error: {exc}") from exc
 
     def list_models(self) -> list[str]:
-        return ["gpt-4o-mini", "gpt-4o", "gpt-4", "gpt-3.5-turbo"]
+        """Static fallback list — always available."""
+        return [
+            "gpt-4o",
+            "o3-mini",
+            "o1",
+            "gpt-4o-mini",
+            "o1-mini",
+            "gpt-4-turbo",
+            "gpt-4.5-preview",
+        ]
+
+    def list_models_live(self) -> list[str]:
+        """Fetch model list from OpenAI API — requires valid key."""
+        if not self.api_key:
+            return self.list_models()
+        url = "https://api.openai.com/v1/models"
+        req = urllib.request.Request(
+            url, headers={"Authorization": f"Bearer {self.api_key}"}, method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            allowed = {
+                "gpt-4o",
+                "o3-mini",
+                "o1",
+                "gpt-4o-mini",
+                "o1-mini",
+                "gpt-4-turbo",
+                "gpt-4.5-preview",
+            }
+            model_ids = []
+            for m in data.get("data", []):
+                mid = m["id"]
+                if mid in allowed:
+                    model_ids.append(mid)
+            
+            preferred = [
+                "gpt-4o",
+                "o3-mini",
+                "o1",
+                "gpt-4o-mini",
+                "o1-mini",
+                "gpt-4-turbo",
+                "gpt-4.5-preview",
+            ]
+            model_ids = sorted(list(set(model_ids)), key=lambda m: preferred.index(m) if m in preferred else len(preferred))
+            return model_ids or self.list_models()
+        except Exception:
+            return self.list_models()
+
