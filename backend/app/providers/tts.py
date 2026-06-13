@@ -643,6 +643,14 @@ class ElevenLabsTTSProvider:
         return h.hexdigest()[:32]
 
 
+# Chatterbox runs heavy CPU inference (~minutes/clip on CPU). Serialize it across
+# the whole process so concurrent requests (e.g. "speak answers" in eval, or rapid
+# Play clicks) can't pile up, saturate every core/all RAM, and starve the API —
+# which is what made the RAG/KB endpoints time out ("Knowledge service unavailable").
+import threading as _threading
+_CHATTERBOX_SYNTH_LOCK = _threading.Lock()
+
+
 class ChatterboxTTSProvider:
     def __init__(
         self,
@@ -694,11 +702,14 @@ class ChatterboxTTSProvider:
                 generated_audio_path=str(output_path),
             )
 
+        # Serialize the actual generation: one cloned-voice synthesis at a time,
+        # process-wide. Others wait their turn instead of all hammering the CPU.
         segment_paths: list[Path] = []
-        for index, part in enumerate(normalized):
-            segment_path = self.audio_cache_dir / f"{cache_key}.{index}.wav"
-            self._generate_segment(part, reference_path, segment_path)
-            segment_paths.append(segment_path)
+        with _CHATTERBOX_SYNTH_LOCK:
+            for index, part in enumerate(normalized):
+                segment_path = self.audio_cache_dir / f"{cache_key}.{index}.wav"
+                self._generate_segment(part, reference_path, segment_path)
+                segment_paths.append(segment_path)
 
         if len(segment_paths) == 1:
             segment_paths[0].replace(output_path)
