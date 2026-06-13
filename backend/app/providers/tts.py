@@ -702,10 +702,17 @@ class ChatterboxTTSProvider:
         from app.services.heavy_jobs import CLONED_VOICE
         segment_paths: list[Path] = []
         with CLONED_VOICE:
-            for index, part in enumerate(normalized):
-                segment_path = self.audio_cache_dir / f"{cache_key}.{index}.wav"
-                self._generate_segment(part, reference_path, segment_path)
-                segment_paths.append(segment_path)
+            # Bilingual consistency: synthesize the WHOLE utterance with ONE model so
+            # the cloned voice does not change timbre between English and Nepali parts.
+            # Pure English uses the English model (best English quality); anything with
+            # Nepali or mixed text uses the multilingual model for the entire text.
+            unified_language: LanguageCode = "en" if languages == {"en"} else \
+                ("ne" if languages == {"ne"} else "mixed")
+            full_text = " ".join(part.text.strip() for part in normalized if part.text.strip())
+            combined = TTSPart(text=full_text, language=unified_language)
+            segment_path = self.audio_cache_dir / f"{cache_key}.0.wav"
+            self._generate_segment(combined, reference_path, segment_path)
+            segment_paths.append(segment_path)
 
         if len(segment_paths) == 1:
             segment_paths[0].replace(output_path)
