@@ -46,6 +46,8 @@ import {
   LifeBuoy
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   API_HTTP,
   API_WS,
@@ -242,6 +244,23 @@ const defaultSettings: BackendSettings = {
   chatterbox_temperature: 0.8,
   chatterbox_repetition_penalty: 1.2,
 };
+
+// Renders assistant answers as formatted markdown (bold, italic, bullets,
+// numbered lists, tables, code, links) so structured RAG answers read cleanly
+// instead of showing raw "**" and "-" characters.
+const Markdown: React.FC<{ children: string }> = ({ children }) => (
+  <div className="md-content">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+        table: ({ node, ...props }) => <div className="md-table-wrap"><table {...props} /></div>,
+      }}
+    >
+      {children || ""}
+    </ReactMarkdown>
+  </div>
+);
 
 interface TypingTextProps {
   text: string;
@@ -2140,11 +2159,7 @@ function ConversationView({
                         fontSize: 14, lineHeight: 1.6, color: "var(--ink)", wordBreak: "break-word"
                       }}>
 
-                        {index === chronoHistory.length - 1 ? (
-                          <TypingText text={turn.response} />
-                        ) : (
-                          turn.response
-                        )}
+                        <Markdown>{turn.response}</Markdown>
                         {turn.response_translation && (
                           <div className="translation-note assistant-translation">
                             {turn.response_translation}
@@ -3801,7 +3816,7 @@ function KnowledgeView({
                   {docChatLog.map((m, i) => (
                     <div key={i} className={`doc-chat-msg ${m.role}`}>
                       <span className="doc-chat-role">{m.role === "user" ? "You" : "AI"}{m.rag ? " · RAG" : ""}</span>
-                      <div>{m.text}</div>
+                      {m.role === "ai" ? <Markdown>{m.text}</Markdown> : <div>{m.text}</div>}
                       {m.audio && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(m.audio!) || "").play(); } catch {} }}><Volume2 size={12} /></button>}
                     </div>
                   ))}

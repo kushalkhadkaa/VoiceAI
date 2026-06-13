@@ -312,6 +312,30 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
   font-size: 11px; color: var(--muted);
 }
 
+/* Formatted markdown answers (chat + eval) */
+.md-content { font-size: 14px; line-height: 1.6; color: var(--ink); word-break: break-word; }
+.md-content > :first-child { margin-top: 0; }
+.md-content > :last-child { margin-bottom: 0; }
+.md-content p { margin: 0 0 8px; }
+.md-content strong { font-weight: 700; color: var(--ink); }
+.md-content em { font-style: italic; }
+.md-content ul, .md-content ol { margin: 6px 0 10px; padding-left: 20px; }
+.md-content li { margin: 3px 0; }
+.md-content li > ul, .md-content li > ol { margin: 3px 0; }
+.md-content h1, .md-content h2, .md-content h3, .md-content h4 { margin: 12px 0 6px; font-weight: 700; line-height: 1.3; }
+.md-content h1 { font-size: 18px; } .md-content h2 { font-size: 16px; } .md-content h3 { font-size: 15px; } .md-content h4 { font-size: 14px; }
+.md-content a { color: var(--teal); text-decoration: underline; }
+.md-content code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; background: rgba(255,255,255,0.08); padding: 1px 6px; border-radius: 4px; }
+.md-content pre { background: var(--panel-2); padding: 10px 12px; border-radius: 8px; overflow-x: auto; margin: 8px 0; }
+.md-content pre code { background: none; padding: 0; }
+.md-content blockquote { margin: 8px 0; padding: 4px 12px; border-left: 3px solid var(--teal); color: var(--muted); }
+.md-table-wrap { overflow-x: auto; margin: 8px 0; }
+.md-content table { border-collapse: collapse; width: 100%; font-size: 13px; }
+.md-content th, .md-content td { border: 1px solid var(--line); padding: 6px 10px; text-align: left; vertical-align: top; }
+.md-content th { background: var(--panel-2); font-weight: 700; }
+.md-content tr:nth-child(even) td { background: rgba(255,255,255,0.03); }
+.md-content hr { border: none; border-top: 1px solid var(--line); margin: 10px 0; }
+
 .translation-note {
   max-width: 100%;
   padding: 7px 10px;
