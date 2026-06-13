@@ -7,6 +7,7 @@ import {
   Mic,
   Play,
   Radio,
+  MicOff,
   Save,
   Send,
   Settings,
@@ -45,6 +46,8 @@ import {
   LifeBuoy
 } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
   API_HTTP,
   API_WS,
@@ -69,6 +72,9 @@ import {
   cleanRecording,
   cloneVoice,
   getVoicesPrompts,
+  getCloningEngines,
+  getSystemPulse,
+  speakText,
   getAuditLogs,
   getRagStatus,
   getSystemInfo,
@@ -104,6 +110,10 @@ import {
   clearKBAnalytics,
   getKBCollectionStats,
   exportKBCollection,
+  kbEvalGenerate,
+  kbEvalCorrect,
+  kbEvalCorrectBulk,
+  chatWithDocument,
   voiceTurnRest,
   setActiveAIProvider,
   getOpenAIModels,
@@ -119,7 +129,7 @@ import {
   type CrawlEvent,
   type CrawlSiteOptions
 } from "./api";
-import type { AdvancedQueryOptions } from "./api";
+import type { AdvancedQueryOptions, EvalQA, EvalRow } from "./api";
 import { blobToBase64, downloadBlob, scoreRecording } from "./audio";
 import type {
   AssistantStatus,
@@ -235,6 +245,23 @@ const defaultSettings: BackendSettings = {
   chatterbox_repetition_penalty: 1.2,
 };
 
+// Renders assistant answers as formatted markdown (bold, italic, bullets,
+// numbered lists, tables, code, links) so structured RAG answers read cleanly
+// instead of showing raw "**" and "-" characters.
+const Markdown: React.FC<{ children: string }> = ({ children }) => (
+  <div className="md-content">
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        a: ({ node, ...props }) => <a {...props} target="_blank" rel="noopener noreferrer" />,
+        table: ({ node, ...props }) => <div className="md-table-wrap"><table {...props} /></div>,
+      }}
+    >
+      {children || ""}
+    </ReactMarkdown>
+  </div>
+);
+
 interface TypingTextProps {
   text: string;
   speedMs?: number;
@@ -300,6 +327,8 @@ const TypingText: React.FC<TypingTextProps> = ({ text, speedMs = 12 }) => {
 
 function App() {
   const [activeView, setActiveView] = useState<ViewId>("conversation");
+  const [pulse, setPulse] = useState<any>(null);
+  const [backendOnline, setBackendOnline] = useState(true);
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [autoVad, setAutoVad] = useLocalStorage("swarlocal.autoVad", true);
   const [history, setHistory] = useState<ConversationTurn[]>([]);
@@ -310,6 +339,7 @@ function App() {
   const [voices, setVoices] = useState<VoicesResponse | null>(null);
   const [manualText, setManualText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [ttsTestingId, setTtsTestingId] = useState<string | null>(null);
   const [lastAudioUrl, setLastAudioUrl] = useState<string | null>(null);
   const [datasetRecordings, setDatasetRecordings] = useState<DatasetRecording[]>([]);
   const [datasetActivePrompt, setDatasetActivePrompt] = useState<string | null>(null);
@@ -386,6 +416,37 @@ function App() {
       setPlayingAudioUrl(null);
     });
   }, [playingAudioUrl]);
+
+  // On-demand TTS: text turns return instantly with no audio; synthesize only
+  // when the user presses Play, then cache the result on the turn.
+  const [speakingTurnId, setSpeakingTurnId] = useState<string | null>(null);
+  const [speakElapsed, setSpeakElapsed] = useState(0);
+  // Live elapsed counter while a voice is being synthesized, so the wait is visible.
+  useEffect(() => {
+    if (!speakingTurnId) { setSpeakElapsed(0); return; }
+    const start = Date.now();
+    const id = window.setInterval(() => setSpeakElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    return () => clearInterval(id);
+  }, [speakingTurnId]);
+  const handleSpeakTurn = useCallback(async (turn: ConversationTurn) => {
+    if (turn.audio_url) { handlePlayTurnAudio(turn.audio_url); return; }
+    if (!turn.response) return;
+    const turnId = (turn as any).id;
+    try {
+      setSpeakingTurnId(turnId ?? turn.response);
+      const res = await speakText(turn.response, selectedVoiceId === "auto" ? undefined : selectedVoiceId);
+      if (res.audio_url) {
+        setHistory((items) => items.map((t: any) => ((t.id ?? t.response) === (turnId ?? turn.response)
+          ? { ...t, audio_url: res.audio_url, actual_voice_name: res.actual_voice_name ?? t.actual_voice_name, actual_engine: res.engine ?? t.actual_engine }
+          : t)));
+        handlePlayTurnAudio(res.audio_url);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not synthesize speech.");
+    } finally {
+      setSpeakingTurnId(null);
+    }
+  }, [selectedVoiceId, handlePlayTurnAudio]);
 
   const socketRef = useRef<WebSocket | null>(null);
   const heartbeatRef = useRef<number | null>(null);
@@ -511,6 +572,38 @@ function App() {
       stopPartials();
       stopLevelMeter();
     };
+  }, [refreshStatus]);
+
+  // Keep the voice list fresh: refetch when the user opens the Voice tab so that
+  // voices cloned in Voice Studio (e.g. a new clone) appear in the picker without a reload.
+  useEffect(() => {
+    if (activeView !== "conversation") return;
+    getVoices().then((v) => { if (v) setVoices(v); }).catch(() => {});
+  }, [activeView]);
+
+  // Heartbeat / pulse: poll system health every 10s. When the backend comes back
+  // after being down/busy, automatically reload everything so RAG and the rest
+  // recover on their own — no manual Retry needed.
+  useEffect(() => {
+    let stopped = false;
+    let wasOnline = true;
+    const tick = async () => {
+      try {
+        const p = await getSystemPulse();
+        if (stopped) return;
+        setPulse(p);
+        setBackendOnline(true);
+        if (!wasOnline) { void refreshStatus(); }  // recovered → reload data
+        wasOnline = true;
+      } catch {
+        if (stopped) return;
+        setBackendOnline(false);
+        wasOnline = false;
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 10000);
+    return () => { stopped = true; clearInterval(id); };
   }, [refreshStatus]);
 
   const handleTurn = useCallback(
@@ -681,6 +774,15 @@ function App() {
       socketRef.current.close();
     }
   }, [selectedVoiceId, selectedKnowledgeId, useInternet, selectedBrain, selectedSttProvider]);
+
+  // Reset a stale knowledge selection (e.g. a deleted collection id left in
+  // localStorage) so we never send a phantom knowledge_id that silently kills RAG.
+  useEffect(() => {
+    if (selectedKnowledgeId !== "none" && ragCollections.length > 0
+        && !ragCollections.find((c: any) => c.id === selectedKnowledgeId)) {
+      setSelectedKnowledgeId("none");
+    }
+  }, [ragCollections, selectedKnowledgeId, setSelectedKnowledgeId]);
 
 
   useEffect(() => {
@@ -1088,10 +1190,11 @@ function App() {
 
   async function runTtsTest(language: "ne" | "en", voiceId?: string) {
     setError(null);
+    setTtsTestingId(voiceId ?? `__${language}`);
     try {
       if (voiceId) {
-        const text = language === "ne" 
-          ? "नमस्ते, यो नयाँ आवाजको पूर्वअवलोकन हो।" 
+        const text = language === "ne"
+          ? "नमस्ते, यो नयाँ आवाजको पूर्वअवलोकन हो।"
           : "Hello, this is a preview of the selected voice.";
         const res = await previewTts(text, voiceId, language);
         if (res.ok && res.audio_url) {
@@ -1102,6 +1205,7 @@ function App() {
           }
         } else {
           setError(res.detail ?? "Voice preview failed.");
+          throw new Error(res.detail ?? "Voice preview failed.");
         }
       } else {
         const text = language === "ne" ? "नमस्ते, Piper आवाज परीक्षण सफल भयो।" : "Hello, Piper voice test was successful.";
@@ -1114,6 +1218,9 @@ function App() {
       }
     } catch (ttsError) {
       setError(ttsError instanceof Error ? ttsError.message : "TTS test failed.");
+      throw ttsError; // let callers (e.g. Voice Studio) show their own busy/error UI
+    } finally {
+      setTtsTestingId(null);
     }
   }
 
@@ -1267,6 +1374,7 @@ function App() {
             auditLogs={auditLogs}
             onRefresh={refreshStatus}
             onTtsTest={runTtsTest}
+            ttsTestingId={ttsTestingId}
           />
         );
       case "knowledge":
@@ -1354,6 +1462,9 @@ function App() {
             onToggleSettings={() => setShowSettings((v) => !v)}
             playingAudioUrl={playingAudioUrl}
             onPlayAudio={handlePlayTurnAudio}
+            onSpeakTurn={handleSpeakTurn}
+            speakingTurnId={speakingTurnId}
+            speakElapsed={speakElapsed}
             onSaveSettings={saveSettings}
             sttLanguage={sttLanguage}
             onSelectSttLanguage={setSttLanguage}
@@ -1439,6 +1550,7 @@ function App() {
             );
           })}
         </nav>
+        <SystemPulse pulse={pulse} online={backendOnline} />
         <div className="sidebar-status">
           <StatusDot status={status} />
           <span>{statusLabels[status]}</span>
@@ -1666,6 +1778,9 @@ function ConversationView({
   onToggleSettings,
   playingAudioUrl,
   onPlayAudio,
+  onSpeakTurn,
+  speakingTurnId,
+  speakElapsed,
   onSaveSettings,
   sttLanguage,
   onSelectSttLanguage,
@@ -1710,6 +1825,9 @@ function ConversationView({
   onToggleSettings: () => void;
   playingAudioUrl: string | null;
   onPlayAudio: (url: string | null | undefined) => void;
+  onSpeakTurn: (turn: ConversationTurn) => void;
+  speakingTurnId: string | null;
+  speakElapsed: number;
   onSaveSettings: (next: BackendSettings) => void;
   sttLanguage: "auto" | "ne" | "en";
   onSelectSttLanguage: (value: "auto" | "ne" | "en") => void;
@@ -2041,11 +2159,7 @@ function ConversationView({
                         fontSize: 14, lineHeight: 1.6, color: "var(--ink)", wordBreak: "break-word"
                       }}>
 
-                        {index === chronoHistory.length - 1 ? (
-                          <TypingText text={turn.response} />
-                        ) : (
-                          turn.response
-                        )}
+                        <Markdown>{turn.response}</Markdown>
                         {turn.response_translation && (
                           <div className="translation-note assistant-translation">
                             {turn.response_translation}
@@ -2062,13 +2176,20 @@ function ConversationView({
                               onClick={() => { try { navigator.clipboard?.writeText(turn.response); } catch { /* ignore */ } }}>
                               <Copy size={12} />
                             </button>
-                            {turn.audio_url && (
-                              <button className={`play-btn ${playingAudioUrl === absoluteAudioUrl(turn.audio_url) ? "playing" : ""}`} type="button"
-                                onClick={() => onPlayAudio(turn.audio_url)} title="Play audio response">
-                                {playingAudioUrl === absoluteAudioUrl(turn.audio_url) ? <Square size={12} /> : <Play size={12} />}
-                                <span style={{ fontSize: 11, marginLeft: 3 }}>{playingAudioUrl === absoluteAudioUrl(turn.audio_url) ? "Stop" : "Play"}</span>
-                              </button>
-                            )}
+                            {turn.response && !turn.is_pending && (() => {
+                              const isSpeaking = speakingTurnId === ((turn as any).id ?? turn.response);
+                              const isPlaying = !!turn.audio_url && playingAudioUrl === absoluteAudioUrl(turn.audio_url);
+                              return (
+                                <button className={`play-btn ${isPlaying ? "playing" : ""} ${isSpeaking ? "speaking" : ""}`} type="button" disabled={isSpeaking}
+                                  onClick={() => onSpeakTurn(turn)}
+                                  title={isSpeaking ? "Generating the voice — please wait" : turn.audio_url ? "Play audio response" : "Speak this answer"}>
+                                  {isSpeaking ? <RefreshCw size={12} className="spin" /> : isPlaying ? <Square size={12} /> : <Play size={12} />}
+                                  <span style={{ fontSize: 11, marginLeft: 3 }}>
+                                    {isSpeaking ? `Generating voice… ${speakElapsed}s` : isPlaying ? "Stop" : "Play"}
+                                  </span>
+                                </button>
+                              );
+                            })()}
                           </div>
                         </div>
                       </div>
@@ -2237,7 +2358,34 @@ function KnowledgeView({
   const [serviceDown, setServiceDown] = useState(false);
 
   // ── Panel mode: null = docs grid ─────────────────────────────────────────
-  const [panel, setPanel] = useState<null | "search" | "analytics" | "config" | "newcol">(null);
+  const [panel, setPanel] = useState<null | "search" | "analytics" | "config" | "newcol" | "eval">(null);
+
+  // ── Evaluation & document chat ──────────────────────────────────────────
+  const [evalDocId, setEvalDocId] = useState<string>("");          // "" = whole collection
+  const [evalAnswerModel, setEvalAnswerModel] = useState("local");
+  const [evalVerifyModel, setEvalVerifyModel] = useState("openai:gpt-4o-mini");
+  const [evalTemp, setEvalTemp] = useState(0.2);
+  const [evalN, setEvalN] = useState(5);
+  const [evalAnswerStyle, setEvalAnswerStyle] = useState<"short" | "detailed">("detailed");
+  const [evalSpeak, setEvalSpeak] = useState(false);
+  const [evalVoice, setEvalVoice] = useState("openai-alloy");
+  const [evalVoices, setEvalVoices] = useState<any[]>([]);
+  const [evalProgress, setEvalProgress] = useState<{ done: number; total: number; startedAt?: number; etaSeconds?: number | null } | null>(null);
+  const [evalFixIdx, setEvalFixIdx] = useState<number | null>(null);
+  const [evalFixText, setEvalFixText] = useState("");
+  const [evalFixedQ, setEvalFixedQ] = useState<Set<string>>(new Set());
+  const [evalSelectedFixes, setEvalSelectedFixes] = useState<Set<string>>(new Set());
+  const [evalBulkFixing, setEvalBulkFixing] = useState(false);
+  const [evalDocsUsed, setEvalDocsUsed] = useState<string[]>([]);
+  const [evalQuestions, setEvalQuestions] = useState<EvalQA[]>([]);
+  const [evalResults, setEvalResults] = useState<EvalRow[] | null>(null);
+  const [evalSummary, setEvalSummary] = useState<{ accuracy: number; counts: Record<string, number>; answer_model: string; verify_model: string } | null>(null);
+  const [evalBusy, setEvalBusy] = useState<null | "gen" | "run">(null);
+  const [evalErr, setEvalErr] = useState<string | null>(null);
+  // Document chat
+  const [docChatInput, setDocChatInput] = useState("");
+  const [docChatLog, setDocChatLog] = useState<{ role: "user" | "ai"; text: string; rag?: boolean; audio?: string | null }[]>([]);
+  const [docChatBusy, setDocChatBusy] = useState(false);
 
   // ── New collection form ───────────────────────────────────────────────────
   const [newColName, setNewColName] = useState("");
@@ -2264,10 +2412,17 @@ function KnowledgeView({
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
 
   // ── Detail drawer ─────────────────────────────────────────────────────────
-  const [docChunks, setDocChunks] = useState<{ text: string; chunk_index: number }[]>([]);
+  const [docChunks, setDocChunks] = useState<{ text: string; chunk_index: number; page_number?: number | null }[]>([]);
   const [loadingChunks, setLoadingChunks] = useState(false);
   const [renamingDocId, setRenamingDocId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  const [genElapsed, setGenElapsed] = useState(0);
+  // Source popup: a clean, opaque modal that opens on top of the eval panel,
+  // shows the source document's text with the answering section highlighted,
+  // and links to the original file when available.
+  const [srcModal, setSrcModal] = useState<{ docId: string; docName: string; match: string; rawAvailable: boolean } | null>(null);
+  const [srcChunks, setSrcChunks] = useState<{ text: string; chunk_index: number; page_number?: number | null }[]>([]);
+  const [srcLoading, setSrcLoading] = useState(false);
 
   // ── Search panel ─────────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState("");
@@ -2322,6 +2477,14 @@ function KnowledgeView({
   };
 
   useEffect(() => { void refresh(); }, []);
+
+  // Self-heal: while the RAG service looks offline, keep retrying every 8s so it
+  // reconnects on its own once the backend is back — no manual Retry needed.
+  useEffect(() => {
+    if (!serviceDown) return;
+    const id = window.setInterval(() => { void refresh(); }, 8000);
+    return () => clearInterval(id);
+  }, [serviceDown]);
 
   const openCollection = async (col: KBCollection) => {
     setSelectedCol(col);
@@ -2445,6 +2608,42 @@ function KnowledgeView({
     finally { setLoadingChunks(false); }
   };
 
+  // Word-overlap score so we can find which chunk a question/answer came from.
+  const _matchScore = (chunkText: string, target: string): number => {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9ऀ-ॿ\s]/g, " ");
+    const ct = norm(chunkText);
+    const words = Array.from(new Set(norm(target).split(/\s+/).filter(w => w.length > 2)));
+    if (!words.length) return 0;
+    let hits = 0;
+    for (const w of words) if (ct.includes(w)) hits++;
+    return hits / words.length;
+  };
+  const srcBestIdx = useMemo(() => {
+    if (!srcModal?.match || !srcChunks.length) return -1;
+    let best = -1, bestScore = 0.34;  // require a minimum overlap to avoid false matches
+    srcChunks.forEach((c, i) => {
+      const s = _matchScore(c.text || "", srcModal.match);
+      if (s > bestScore) { bestScore = s; best = i; }
+    });
+    return best;
+  }, [srcModal, srcChunks]);
+
+  // Open a clean popup showing the source document's text, with the section that
+  // answers the question highlighted — on top of the eval panel (no redirect).
+  const openSourceForQA = async (sourceDoc: string | null | undefined, matchText: string) => {
+    if (!sourceDoc || !selectedCol) return;
+    const doc = documents.find(d => d.filename === sourceDoc) || documents.find(d => sourceDoc.includes(d.filename) || d.filename.includes(sourceDoc));
+    if (!doc) { setError(`Could not find the source document "${sourceDoc}" in this collection.`); return; }
+    setSrcModal({ docId: doc.id, docName: doc.filename, match: matchText, rawAvailable: false });
+    setSrcChunks([]); setSrcLoading(true);
+    try {
+      const res = await getKBDocumentChunks(selectedCol.id, doc.id, 500);
+      setSrcChunks(res.chunks ?? []);
+      setSrcModal(m => m ? { ...m, rawAvailable: !!(res as any).raw_available } : m);
+    } catch (e: any) { setError(e.message); }
+    finally { setSrcLoading(false); }
+  };
+
   const handleDeleteDoc = async (docId: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!selectedCol || !confirm("Delete this document and all its chunks?")) return;
@@ -2486,6 +2685,136 @@ function KnowledgeView({
     finally { setSearching(false); }
   };
 
+  // ── Evaluation & document chat ──────────────────────────────────────────
+  const evalScopeLabel = evalDocId
+    ? (documents.find(d => d.id === evalDocId)?.filename ?? "selected document")
+    : `whole collection (${documents.length} docs)`;
+
+  const handleGenerateQuestions = async () => {
+    if (!selectedCol) return;
+    setEvalBusy("gen"); setEvalErr(null); setEvalResults(null); setEvalSummary(null); setEvalDocsUsed([]);
+    try {
+      const res = await kbEvalGenerate({
+        collection_id: selectedCol.id, document_id: evalDocId || null, n: evalN, gen_model: "openai",
+        answer_style: evalAnswerStyle,
+      });
+      setEvalQuestions(res.questions);
+      setEvalDocsUsed(res.documents_used ?? []);
+      if (!res.questions.length) setEvalErr("No questions could be generated from this scope.");
+    } catch (e: any) { setEvalErr(e.message); }
+    finally { setEvalBusy(null); }
+  };
+
+  // Streaming evaluation: results arrive and animate in one-by-one with a live
+  // progress bar, so a long run never feels frozen.
+  const handleRunEval = async () => {
+    if (!selectedCol || !evalQuestions.length) return;
+    setEvalBusy("run"); setEvalErr(null); setEvalResults([]); setEvalSummary(null);
+    setEvalSelectedFixes(new Set());
+    const startedAt = Date.now();
+    setEvalProgress({ done: 0, total: evalQuestions.length, startedAt, etaSeconds: null }); setEvalFixIdx(null);
+    try {
+      const resp = await fetch(`${API_HTTP}/kb/eval/run-stream`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          collection_id: selectedCol.id, document_id: evalDocId || null, questions: evalQuestions,
+          answer_model: evalAnswerModel, verify_model: evalVerifyModel, temperature: evalTemp,
+          voice_id: evalSpeak ? evalVoice : null,
+        }),
+      });
+      if (!resp.ok || !resp.body) {
+        const d = await resp.json().catch(() => null);
+        throw new Error(d?.detail ?? "Evaluation failed to start.");
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split("\n\n");
+        buf = frames.pop() || "";
+        for (const frame of frames) {
+          const line = frame.split("\n").find(l => l.startsWith("data:"));
+          if (!line) continue;
+          let evt: any;
+          try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+          if (evt.type === "start") {
+            setEvalProgress({ done: 0, total: evt.total, startedAt, etaSeconds: null });
+          } else if (evt.type === "result") {
+            setEvalResults(prev => [...(prev || []), evt.result]);
+            const elapsed = (Date.now() - startedAt) / 1000;
+            const avg = elapsed / Math.max(1, evt.index);
+            const etaSeconds = Math.max(0, Math.round(avg * (evt.total - evt.index)));
+            setEvalProgress({ done: evt.index, total: evt.total, startedAt, etaSeconds });
+            setEvalSummary({ accuracy: evt.accuracy, counts: evt.counts, answer_model: evalAnswerModel, verify_model: evalVerifyModel });
+            if (evalSpeak && evt.result?.audio_url) { try { new Audio(absoluteAudioUrl(evt.result.audio_url) || "").play(); } catch { /* ignore */ } }
+          } else if (evt.type === "done") {
+            setEvalSummary({ accuracy: evt.accuracy, counts: evt.counts, answer_model: evt.answer_model, verify_model: evt.verify_model });
+            setEvalProgress(p => p ? { ...p, done: p.total } : null);
+          }
+        }
+      }
+    } catch (e: any) { setEvalErr(e.message); }
+    finally { setEvalBusy(null); }
+  };
+
+  const handleFixInKB = async (row: EvalRow, corrected: string) => {
+    if (!selectedCol || !corrected.trim()) return;
+    try {
+      await kbEvalCorrect({ collection_id: selectedCol.id, question: row.question, answer: corrected.trim() });
+      setEvalFixedQ(prev => new Set(prev).add(row.question));
+      setEvalFixIdx(null);
+      void refresh();   // refresh chunk/doc counts so the new correction shows up
+    } catch (e: any) { setEvalErr(e.message); }
+  };
+
+  const handleBulkFixInKB = async () => {
+    if (!selectedCol || !evalResults) return;
+    const selected = evalResults.filter(r => evalSelectedFixes.has(r.question));
+    if (!selected.length) return;
+    setEvalBulkFixing(true); setEvalErr(null);
+    try {
+      await kbEvalCorrectBulk({
+        collection_id: selectedCol.id,
+        items: selected.map(r => ({
+          question: r.question,
+          answer: r.reference,
+          source_doc: r.source_doc,
+          verdict: r.verdict,
+        })),
+      });
+      setEvalFixedQ(prev => {
+        const next = new Set(prev);
+        selected.forEach(r => next.add(r.question));
+        return next;
+      });
+      setEvalSelectedFixes(new Set());
+      void refresh();
+    } catch (e: any) { setEvalErr(e.message); }
+    finally { setEvalBulkFixing(false); }
+  };
+
+  const handleDocChatSend = async () => {
+    const text = docChatInput.trim();
+    if (!text || !selectedCol) return;
+    setDocChatInput("");
+    setDocChatLog(l => [...l, { role: "user", text }]);
+    setDocChatBusy(true);
+    try {
+      const res = await chatWithDocument({
+        text, collection_id: selectedCol.id, document_id: evalDocId || null,
+        llm_provider_id: evalAnswerModel, temperature: evalTemp,
+        voice_id: evalSpeak ? "openai-alloy" : null,
+      });
+      setDocChatLog(l => [...l, { role: "ai", text: res.response || "(no answer)", rag: !!res.rag_used, audio: res.audio_url }]);
+      if (evalSpeak && res.audio_url) { try { new Audio(absoluteAudioUrl(res.audio_url) || "").play(); } catch {} }
+    } catch (e: any) {
+      setDocChatLog(l => [...l, { role: "ai", text: "Error: " + e.message }]);
+    } finally { setDocChatBusy(false); }
+  };
+
   // ── Analytics ─────────────────────────────────────────────────────────────
   const loadAnalytics = async () => {
     setAnalyticsLoading(true);
@@ -2495,6 +2824,25 @@ function KnowledgeView({
   };
 
   useEffect(() => { if (panel === "analytics") void loadAnalytics(); }, [panel]);
+  // Load selectable voices (cloned + OpenAI + built-in) when the eval panel opens.
+  useEffect(() => {
+    if (panel !== "eval") return;
+    getVoices().then((v: any) => { if (v?.voices) setEvalVoices(v.voices); }).catch(() => {});
+  }, [panel]);
+  // Live elapsed timer while questions are being generated (drives the animation).
+  useEffect(() => {
+    if (evalBusy !== "gen") { setGenElapsed(0); return; }
+    const start = Date.now();
+    const id = window.setInterval(() => setGenElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    return () => clearInterval(id);
+  }, [evalBusy]);
+  // Scroll the highlighted source chunk into view in the source popup.
+  const srcHighlightRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (srcBestIdx >= 0 && srcHighlightRef.current) {
+      srcHighlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [srcBestIdx, srcChunks]);
 
   // ── Config save ───────────────────────────────────────────────────────────
   const handleSaveConfig = async () => {
@@ -2515,6 +2863,10 @@ function KnowledgeView({
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const embOk = kbStatus?.embedding?.ok;
+  const evalFixableRows = evalResults?.filter(r => (r.verdict === "incorrect" || r.verdict === "partial") && !evalFixedQ.has(r.question)) ?? [];
+  const evalSelectedFixCount = evalFixableRows.filter(r => evalSelectedFixes.has(r.question)).length;
+  const evalEtaText = evalProgress?.etaSeconds != null ? `ETA ${formatUptime(evalProgress.etaSeconds)}` : "Calculating ETA";
+  const evalExpectedTime = `${evalSpeak ? "~12-35s" : "~3-15s"} per question depending on selected models${evalSpeak ? " and voice synthesis" : ""}`;
   const filteredDocs = documents.filter(d =>
     d.filename.toLowerCase().includes(docSearch.toLowerCase()) ||
     (d.source_url ?? "").toLowerCase().includes(docSearch.toLowerCase())
@@ -2539,14 +2891,40 @@ function KnowledgeView({
               : <span className="rag-status-badge err" style={{ marginLeft: "auto", fontSize: 10 }}><CircleAlert size={10} />Offline</span>}
           </h2>
           <p>{collections.length} knowledge base{collections.length !== 1 ? "s" : ""}</p>
+          {kbStatus && (
+            <div className="rag-kb-path" title={kbStatus.db_path}>
+              {kbStatus.document_count} docs · {kbStatus.chunk_count} chunks
+            </div>
+          )}
         </div>
 
         <div className="rag-col-list">
-          {collections.length === 0 && (
+          {collections.length === 0 && serviceDown && (
+            <div className="rag-offline-card">
+              <RefreshCw size={22} className="spin" style={{ color: "var(--amber, #f59e0b)", marginBottom: 8 }} />
+              <div className="rag-offline-title">Reconnecting to the knowledge service…</div>
+              <div className="rag-offline-body">
+                Your documents are <b>not lost</b> — the backend just stopped responding for a moment
+                (usually after a heavy voice job, low memory/disk, or a restart). This panel
+                reconnects automatically as soon as it's back.
+              </div>
+              <button className="rag-toolbar-btn" onClick={() => void refresh()} style={{ marginTop: 10 }}>
+                <RefreshCw size={12} /> Retry now
+              </button>
+            </div>
+          )}
+          {collections.length === 0 && !serviceDown && (
             <div style={{ padding: "20px 8px", textAlign: "center", color: "var(--muted)", fontSize: 12 }}>
               <Database size={28} style={{ opacity: 0.3, marginBottom: 8 }} />
-              <div>No knowledge bases yet.</div>
-              <div>Create one below.</div>
+              <div style={{ color: "var(--ink)", fontWeight: 700 }}>No knowledge bases loaded here.</div>
+              <div style={{ lineHeight: 1.5, marginTop: 6 }}>
+                This means the current backend has no indexed collections in its local KB path.
+                Your documents are not deleted by this screen.
+              </div>
+              <div className="rag-empty-fix">
+                <b>Fix:</b> create a knowledge base below, import documents, or confirm the app is using backend
+                <code>127.0.0.1:8001</code> and repo <code>/Users/kushalkhadka/VoiceAI</code>.
+              </div>
             </div>
           )}
           {collections.map((col, i) => (
@@ -2630,6 +3008,12 @@ function KnowledgeView({
             <button className={`rag-toolbar-btn ${panel === "search" ? "active" : ""}`} onClick={() => setPanel(p => p === "search" ? null : "search")}>
               <Search size={14} /><span>Search</span>
             </button>
+            {/* Evaluate */}
+            {selectedCol && (
+              <button className={`rag-toolbar-btn ${panel === "eval" ? "active" : ""}`} onClick={() => setPanel(p => p === "eval" ? null : "eval")}>
+                <CheckCircle2 size={14} /><span>Evaluate</span>
+              </button>
+            )}
             {/* Analytics */}
             <button className={`rag-toolbar-btn ${panel === "analytics" ? "active" : ""}`} onClick={() => setPanel(p => p === "analytics" ? null : "analytics")}>
               <Activity size={14} /><span>Analytics</span>
@@ -2707,8 +3091,21 @@ function KnowledgeView({
             /* ── No collection selected ── */
             <div className="rag-empty" style={{ paddingTop: 80 }}>
               <div className="rag-empty-icon"><Database size={28} /></div>
-              <h3>Select a Knowledge Base</h3>
-              <p>Choose a knowledge base from the sidebar, or create one to start adding documents.</p>
+              <h3>{collections.length ? "Select a Knowledge Base" : "RAG Is Ready, But No Collection Is Selected"}</h3>
+              <p>
+                {collections.length
+                  ? "Choose a knowledge base from the sidebar to browse documents, search, chat, or evaluate it."
+                  : serviceDown
+                    ? "The backend knowledge API is not responding right now. The pulse checker will reconnect automatically and show the exact reason."
+                    : "No collection is loaded in this backend session. Create one or import your documents; if you expected existing data, check that the app is connected to the active backend on port 8001."}
+              </p>
+              {kbStatus && (
+                <div className="rag-diagnostic-card">
+                  <b>Current KB path</b>
+                  <code>{kbStatus.db_path}</code>
+                  <span>{kbStatus.collection_count} collection(s), {kbStatus.document_count} document(s), {kbStatus.chunk_count} chunk(s)</span>
+                </div>
+              )}
               <button className="rag-toolbar-btn primary" style={{ marginTop: 4 }} onClick={() => setPanel("newcol")}>
                 <Plus size={14} /><span>Create Knowledge Base</span>
               </button>
@@ -3005,7 +3402,7 @@ function KnowledgeView({
               ) : (
                 docChunks.map(c => (
                   <div key={c.chunk_index} className="chunk-card">
-                    <div className="chunk-card-label">CHUNK #{c.chunk_index}</div>
+                    <div className="chunk-card-label">CHUNK #{c.chunk_index}{c.page_number != null ? ` · page ${c.page_number}` : ""}</div>
                     <p>{c.text}</p>
                   </div>
                 ))
@@ -3135,6 +3532,346 @@ function KnowledgeView({
               {searchResults.length === 0 && searchMeta && !searching && (
                 <div className="rag-empty"><div className="rag-empty-icon"><Search size={22} /></div><h3>No results</h3><p>Lower min score or try different terms.</p></div>
               )}
+            </div>
+          </div>
+        )}
+
+        {panel === "eval" && selectedCol && (
+          <div className="rag-panel-overlay">
+            <div className="rag-panel-header">
+              <CheckCircle2 size={18} style={{ color: "var(--teal)" }} />
+              <h2>Evaluate &amp; Chat — {selectedCol.name}</h2>
+              <button onClick={() => setPanel(null)} style={{ marginLeft: "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", padding: "0 4px" }}>✕</button>
+            </div>
+            <div className="rag-panel-body">
+              {/* Controls */}
+              <div className="eval-controls">
+                <div className="eval-field">
+                  <label>Scope</label>
+                  <select value={evalDocId} onChange={e => { setEvalDocId(e.target.value); setEvalQuestions([]); setEvalResults(null); setEvalSummary(null); }}>
+                    <option value="">Whole collection ({documents.length} docs)</option>
+                    {documents.map(d => <option key={d.id} value={d.id}>{d.filename} ({d.chunk_count} chunks)</option>)}
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label>Answer model</label>
+                  <select value={evalAnswerModel} onChange={e => setEvalAnswerModel(e.target.value)}>
+                    <option value="local">Local (Ollama)</option>
+                    <optgroup label="OpenAI">
+                      {OPENAI_EVAL_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                    </optgroup>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label>Verify model</label>
+                  <select value={evalVerifyModel} onChange={e => setEvalVerifyModel(e.target.value)}>
+                    <optgroup label="OpenAI">
+                      {OPENAI_EVAL_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                    </optgroup>
+                    <option value="gemini">Gemini</option>
+                    <option value="local">Local (Ollama)</option>
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label># Questions: <b>{evalN}</b></label>
+                  <input type="range" min={1} max={100} value={evalN} onChange={e => setEvalN(Number(e.target.value))} />
+                  <input type="number" min={1} max={100} value={evalN} onChange={e => setEvalN(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} />
+                </div>
+                <div className="eval-field">
+                  <label>Reference answer depth</label>
+                  <select value={evalAnswerStyle} onChange={e => setEvalAnswerStyle(e.target.value as "short" | "detailed")}>
+                    <option value="detailed">Detailed when needed</option>
+                    <option value="short">Exact short facts</option>
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label>Temperature: <b>{evalTemp.toFixed(2)}</b></label>
+                  <input type="range" min={0} max={1} step={0.05} value={evalTemp} onChange={e => setEvalTemp(Number(e.target.value))} />
+                </div>
+                <label className="eval-speak">
+                  <input type="checkbox" checked={evalSpeak} onChange={e => setEvalSpeak(e.target.checked)} />
+                  <span>🔊 Speak answers</span>
+                </label>
+                <div className="eval-field">
+                  <label>Voice</label>
+                  <select value={evalVoice} onChange={e => setEvalVoice(e.target.value)} disabled={!evalSpeak}>
+                    <option value="openai-alloy">OpenAI Alloy</option>
+                    {evalVoices.filter(v => v.id?.startsWith("openai-") && v.id !== "openai-alloy").length > 0 && (
+                      <optgroup label="OpenAI Cloud">
+                        {evalVoices.filter(v => v.id?.startsWith("openai-") && v.id !== "openai-alloy").map(v => <option key={v.id} value={v.id}>{v.name || v.id}</option>)}
+                      </optgroup>
+                    )}
+                    {evalVoices.filter(v => !v.id?.startsWith("openai-") && !["ne_NP-chitwan-medium","en_US-lessac-medium","ne_NP-google-medium","en_US-ryan-medium"].includes(v.id)).length > 0 && (
+                      <optgroup label="My cloned voices">
+                        {evalVoices.filter(v => !v.id?.startsWith("openai-") && !["ne_NP-chitwan-medium","en_US-lessac-medium","ne_NP-google-medium","en_US-ryan-medium"].includes(v.id)).map(v => <option key={v.id} value={v.id} disabled={!v.model_exists}>{v.name || v.id}{v.model_exists ? "" : " — untrained"}</option>)}
+                      </optgroup>
+                    )}
+                    <optgroup label="Built-in (Piper)">
+                      <option value="ne_NP-chitwan-medium">Chitwan Nepali</option>
+                      <option value="en_US-lessac-medium">Lessac English</option>
+                    </optgroup>
+                  </select>
+                </div>
+              </div>
+              <div className="eval-actions">
+                <button className="rag-toolbar-btn primary" onClick={handleGenerateQuestions} disabled={evalBusy !== null}>
+                  {evalBusy === "gen" ? <RefreshCw size={13} className="spin" /> : <Sparkles size={13} />}
+                  <span>{evalBusy === "gen" ? "Generating…" : "Generate questions"}</span>
+                </button>
+                <button className="rag-toolbar-btn" onClick={handleRunEval} disabled={evalBusy !== null || !evalQuestions.length}>
+                  {evalBusy === "run" ? <RefreshCw size={13} className="spin" /> : <Activity size={13} />}
+                  <span>{evalBusy === "run" ? "Evaluating…" : `Run evaluation (${evalQuestions.length})`}</span>
+                </button>
+                <span className="eval-scope-note">Scope: {evalScopeLabel}</span>
+              </div>
+              <div className="eval-guidance">
+                <Info size={14} />
+                <span>
+                  Generation now samples across documents in the selected collection. Evaluation can take time because each question is answered, retrieved from KB, then judged by a verifier. Expected: {evalExpectedTime}. Keep "Speak answers" off for the fastest run.
+                </span>
+              </div>
+              {evalErr && <div className="eval-err"><CircleAlert size={14} /> {evalErr}</div>}
+
+              {/* Animated "generating questions" experience */}
+              {evalBusy === "gen" && (() => {
+                const phases = [
+                  { icon: "📚", text: "Reading documents across the collection…" },
+                  { icon: "✍️", text: "Drafting diverse questions from each document…" },
+                  { icon: "🔎", text: "Pulling the exact answers from the source text…" },
+                  { icon: "🧭", text: "Tagging each question's document and topic…" },
+                  { icon: "✨", text: "Polishing the final set…" },
+                ];
+                const phase = phases[Math.min(phases.length - 1, Math.floor(genElapsed / 4))];
+                return (
+                  <div className="gen-anim">
+                    <div className="gen-anim-orb"><Sparkles size={22} /></div>
+                    <div className="gen-anim-body">
+                      <div className="gen-anim-title">Generating {evalN} question{evalN === 1 ? "" : "s"} <span className="gen-anim-time">{genElapsed}s</span></div>
+                      <div className="gen-anim-phase">{phase.icon} {phase.text}</div>
+                      <div className="gen-anim-track"><div className="gen-anim-fill" /></div>
+                      <div className="gen-anim-steps">
+                        {phases.map((p, i) => <span key={i} className={`gen-step ${genElapsed / 4 >= i ? "done" : ""} ${Math.floor(genElapsed / 4) === i ? "active" : ""}`}>{p.icon}</span>)}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Animated progress while evaluating */}
+              {evalProgress && (evalBusy === "run" || evalProgress.done < evalProgress.total) && (
+                <div className="eval-progress">
+                  <div className="eval-progress-head">
+                    <span className="eval-progress-spinner"><RefreshCw size={13} className="spin" /></span>
+                    <span>Evaluating question <b>{Math.min(evalProgress.done + (evalBusy === "run" ? 1 : 0), evalProgress.total)}</b> of <b>{evalProgress.total}</b></span>
+                    <span className="eval-progress-eta">{evalEtaText}</span>
+                    <span className="eval-progress-pct">{Math.round((evalProgress.done / Math.max(1, evalProgress.total)) * 100)}%</span>
+                  </div>
+                  <div className="eval-progress-track">
+                    <div className="eval-progress-fill" style={{ width: `${(evalProgress.done / Math.max(1, evalProgress.total)) * 100}%` }} />
+                  </div>
+                  <div className="eval-progress-dots">
+                    {Array.from({ length: evalProgress.total }).map((_, i) => {
+                      const r = evalResults?.[i];
+                      const cls = r ? `v-${r.verdict}` : (i === evalProgress.done && evalBusy === "run" ? "active" : "");
+                      return <span key={i} className={`eval-dot ${cls}`} />;
+                    })}
+                  </div>
+                </div>
+              )}
+
+              {/* Generated questions preview */}
+              {evalQuestions.length > 0 && !evalResults && (
+                <div className="eval-section">
+                  <div className="eval-section-title">{evalQuestions.length} questions delivered from {evalScopeLabel}</div>
+                  {evalDocsUsed.length > 0 && (
+                    <div className="eval-doc-coverage">
+                      Covered {evalDocsUsed.length} source document{evalDocsUsed.length === 1 ? "" : "s"}: {evalDocsUsed.slice(0, 8).join(", ")}{evalDocsUsed.length > 8 ? ` +${evalDocsUsed.length - 8} more` : ""}
+                    </div>
+                  )}
+                  <ol className="eval-qlist">
+                    {evalQuestions.map((q, i) => <li key={i}><b>{q.q}</b><span>{q.a}</span>{q.source_doc && (
+                      <button type="button" className="eval-source-link" title={`Open ${q.source_doc} and highlight the exact section`} onClick={() => openSourceForQA(q.source_doc, q.a || q.q)}>
+                        <FileText size={11} /> {q.source_doc}{q.dimension ? ` · ${q.dimension}` : ""} <ChevronRight size={11} />
+                      </button>
+                    )}</li>)}
+                  </ol>
+                </div>
+              )}
+
+              {/* Results scoreboard */}
+              {evalSummary && (
+                <div className="eval-scoreboard">
+                  <div className="eval-score-main">
+                    <div className="eval-accuracy">{evalSummary.accuracy}%</div>
+                    <div className="eval-score-sub">accuracy<br /><span>{evalSummary.answer_model} answered · {evalSummary.verify_model} verified</span></div>
+                  </div>
+                  <div className="eval-score-pills">
+                    <span className="pill good">✓ {evalSummary.counts.correct} correct</span>
+                    <span className="pill warn">~ {evalSummary.counts.partial} partial</span>
+                    <span className="pill" style={{ color: "var(--rose)" }}>✗ {evalSummary.counts.incorrect} incorrect</span>
+                    {evalSummary.counts.error > 0 && <span className="pill">⚠ {evalSummary.counts.error} error</span>}
+                  </div>
+                </div>
+              )}
+
+              {/* Results table */}
+              {evalResults && (
+                <div className="eval-section">
+                  <div className="eval-section-title">Detailed results</div>
+                  {evalFixableRows.length > 0 && (
+                    <div className="eval-bulk-fix">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={evalSelectedFixCount === evalFixableRows.length}
+                          onChange={e => {
+                            if (e.target.checked) {
+                              setEvalSelectedFixes(new Set(evalFixableRows.map(r => r.question)));
+                            } else {
+                              setEvalSelectedFixes(new Set());
+                            }
+                          }}
+                        />
+                        <span>Select all partial/incorrect answers ({evalFixableRows.length})</span>
+                      </label>
+                      <button className="rag-toolbar-btn primary" onClick={handleBulkFixInKB} disabled={evalBulkFixing || evalSelectedFixCount === 0}>
+                        {evalBulkFixing ? <RefreshCw size={12} className="spin" /> : <Wand2 size={12} />}
+                        Bulk fix selected ({evalSelectedFixCount})
+                      </button>
+                      <small>Uses the verified expected answers as a curated correction pack.</small>
+                    </div>
+                  )}
+                  {evalResults.map((r, i) => {
+                    const needsFix = r.verdict === "incorrect" || r.verdict === "partial";
+                    const fixed = evalFixedQ.has(r.question);
+                    return (
+                    <div key={i} className={`eval-row v-${r.verdict} eval-row-reveal`}>
+                      <div className="eval-row-head">
+                        {needsFix && !fixed && (
+                          <input
+                            type="checkbox"
+                            checked={evalSelectedFixes.has(r.question)}
+                            onChange={e => setEvalSelectedFixes(prev => {
+                              const next = new Set(prev);
+                              if (e.target.checked) next.add(r.question); else next.delete(r.question);
+                              return next;
+                            })}
+                            title="Select for bulk fix"
+                          />
+                        )}
+                        <span className={`eval-verdict v-${r.verdict}`}>{r.verdict}</span>
+                        {typeof r.score === "number" && <span className="eval-score-chip">{r.score}%</span>}
+                        <span className="eval-q">{r.question}</span>
+                        {r.rag_used && <span className="pill good">RAG</span>}
+                        <span className="eval-lat">{r.latency_s}s</span>
+                      </div>
+                      <div className="eval-row-body">
+                        {(r.source_doc || r.dimension) && (
+                          <div className="eval-source"><b>Source:</b>{" "}
+                            {r.source_doc ? (
+                              <button type="button" className="eval-source-link" title={`Open ${r.source_doc} and highlight the section that answers this`} onClick={() => openSourceForQA(r.source_doc, r.reference || r.answer || r.question || "")}>
+                                <FileText size={11} /> {r.source_doc}{r.dimension ? ` · ${r.dimension}` : ""} <ChevronRight size={11} />
+                              </button>
+                            ) : <span>unknown{r.dimension ? ` · ${r.dimension}` : ""}</span>}
+                          </div>
+                        )}
+                        <div><b>Expected:</b> {r.reference}</div>
+                        <div><b>Answer:</b> {r.answer}</div>
+                        {r.reason && <div className="eval-reason"><b>Judge:</b> {r.reason}</div>}
+                        <div className="eval-row-actions">
+                          {r.audio_url && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(r.audio_url!) || "").play(); } catch {} }}><Volume2 size={12} /> Play</button>}
+                          {fixed ? (
+                            <span className="eval-fixed"><CheckCircle2 size={13} /> Added to knowledge base</span>
+                          ) : needsFix && (
+                            <button className="rag-toolbar-btn eval-fix-btn" onClick={() => { setEvalFixIdx(evalFixIdx === i ? null : i); setEvalFixText(r.reference || ""); }}>
+                              <Wand2 size={12} /> Fix in KB
+                            </button>
+                          )}
+                        </div>
+                        {evalFixIdx === i && !fixed && (
+                          <div className="eval-fix-editor">
+                            <label>Correct answer to teach the knowledge base</label>
+                            <textarea value={evalFixText} onChange={e => setEvalFixText(e.target.value)} rows={2} placeholder="Type the correct, verified answer…" />
+                            <div className="eval-fix-actions">
+                              <button className="rag-toolbar-btn" onClick={() => setEvalFixIdx(null)}>Cancel</button>
+                              <button className="rag-toolbar-btn primary" onClick={() => void handleFixInKB(r, evalFixText)} disabled={!evalFixText.trim()}>
+                                <Save size={12} /> Save to knowledge base
+                              </button>
+                            </div>
+                            <p className="eval-fix-hint">This saves a verified Q&amp;A into the collection so the assistant answers correctly next time.</p>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  );})}
+                </div>
+              )}
+
+              {/* Chat with this document */}
+              <div className="eval-section">
+                <div className="eval-section-title"><Radio size={13} /> Chat with {evalDocId ? "this document" : "this collection"} ({evalAnswerModel}, temp {evalTemp.toFixed(2)})</div>
+                <div className="doc-chat-log">
+                  {docChatLog.length === 0 && <div className="doc-chat-empty">Ask a question grounded in {evalScopeLabel}.</div>}
+                  {docChatLog.map((m, i) => (
+                    <div key={i} className={`doc-chat-msg ${m.role}`}>
+                      <span className="doc-chat-role">{m.role === "user" ? "You" : "AI"}{m.rag ? " · RAG" : ""}</span>
+                      {m.role === "ai" ? <Markdown>{m.text}</Markdown> : <div>{m.text}</div>}
+                      {m.audio && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(m.audio!) || "").play(); } catch {} }}><Volume2 size={12} /></button>}
+                    </div>
+                  ))}
+                  {docChatBusy && <div className="doc-chat-msg ai"><RefreshCw size={13} className="spin" /> thinking…</div>}
+                </div>
+                <form className="doc-chat-input" onSubmit={e => { e.preventDefault(); void handleDocChatSend(); }}>
+                  <input value={docChatInput} onChange={e => setDocChatInput(e.target.value)} placeholder="Ask about this document…" disabled={docChatBusy} />
+                  <button type="submit" className="rag-toolbar-btn primary" disabled={docChatBusy || !docChatInput.trim()}><Send size={13} /></button>
+                </form>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Source popup — clean, opaque, on top of the eval panel; highlights the
+            answering section and links to the original file when available. */}
+        {srcModal && selectedCol && (
+          <div className="source-modal-backdrop" onClick={() => setSrcModal(null)}>
+            <div className="source-modal" onClick={e => e.stopPropagation()}>
+              <div className="source-modal-head">
+                <FileText size={16} />
+                <strong title={srcModal.docName}>{srcModal.docName}</strong>
+                {srcModal.rawAvailable && (
+                  <a className="source-open-file" href={`${API_HTTP}/kb/collections/${selectedCol.id}/documents/${srcModal.docId}/file`}
+                    target="_blank" rel="noopener noreferrer">
+                    <Download size={13} /> Open original file
+                  </a>
+                )}
+                <button className="source-modal-close" onClick={() => setSrcModal(null)} title="Close">✕</button>
+              </div>
+              <div className="source-modal-sub">
+                {srcLoading ? "Loading the source document…"
+                  : srcBestIdx >= 0 ? "The highlighted section is where this answer comes from."
+                  : "Showing the full source document."}
+              </div>
+              <div className="source-modal-body">
+                {srcLoading ? (
+                  <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}><RefreshCw size={20} className="spin" /></div>
+                ) : srcChunks.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>No content found for this document.</div>
+                ) : (
+                  srcChunks.map((c, ci) => {
+                    const hot = ci === srcBestIdx;
+                    return (
+                      <div key={c.chunk_index} ref={hot ? srcHighlightRef : undefined} className={`chunk-card${hot ? " chunk-highlight" : ""}`}>
+                        <div className="chunk-card-label">
+                          CHUNK #{c.chunk_index}{c.page_number != null ? ` · page ${c.page_number}` : ""}
+                          {hot && <span className="chunk-hot-badge">★ source of the answer</span>}
+                        </div>
+                        <p>{c.text}</p>
+                      </div>
+                    );
+                  })
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -4103,7 +4840,7 @@ function SetupView({
   voiceSocketStatus: VoiceSocketStatus | null;
   onRefresh: () => void;
   onTestVoiceSocket: () => void;
-  onTtsTest: (language: "ne" | "en", voiceId?: string) => void;
+  onTtsTest: (language: "ne" | "en", voiceId?: string) => Promise<void> | void;
 }) {
   const blockers = providerStatus.filter((provider) => !provider.ok && provider.critical !== false);
   const others = providerStatus.filter((provider) => provider.ok || provider.critical === false);
@@ -4156,11 +4893,11 @@ function SetupView({
         ))}
       </div>
       <div className="action-band">
-        <button className="icon-text" onClick={() => onTtsTest("ne")} type="button">
+        <button className="icon-text" onClick={() => { Promise.resolve(onTtsTest("ne")).catch(() => {}); }} type="button">
           <Volume2 size={18} />
           <span>Nepali TTS</span>
         </button>
-        <button className="icon-text" onClick={() => onTtsTest("en")} type="button">
+        <button className="icon-text" onClick={() => { Promise.resolve(onTtsTest("en")).catch(() => {}); }} type="button">
           <Volume2 size={18} />
           <span>English TTS</span>
         </button>
@@ -4224,6 +4961,121 @@ function UseCaseCard({ icon, title, body, example }: { icon: React.ReactNode; ti
   );
 }
 
+// Friendly names + install hints for the cloning engines (keyed by engine id).
+const ENGINE_LABELS: Record<string, string> = {
+  chatterbox: "Chatterbox local clone",
+  piper: "Piper fine-tune",
+  elevenlabs: "ElevenLabs (cloud)",
+  f5_tts: "F5-TTS",
+  openvoice: "OpenVoice",
+  voxcpm: "VoxCPM",
+};
+const ENGINE_INSTALL_HINT: Record<string, string> = {
+  chatterbox: "pip install chatterbox-tts",
+  f5_tts: "pip install f5-tts",
+  openvoice: "pip install openvoice",
+  voxcpm: "pip install voxcpm",
+};
+function fmtDuration(totalSeconds: number): string {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// Selectable OpenAI models for the evaluation answer/verify pickers. Encoded as
+// "openai:<model>" so the backend can route to a specific model. Mix of GPT-4 and
+// GPT-5 families; the account must have access to the chosen model.
+const OPENAI_EVAL_MODELS: { value: string; label: string }[] = [
+  { value: "openai:gpt-4o-mini", label: "OpenAI · gpt-4o-mini" },
+  { value: "openai:gpt-4o", label: "OpenAI · gpt-4o" },
+  { value: "openai:gpt-4.1-mini", label: "OpenAI · gpt-4.1-mini" },
+  { value: "openai:gpt-5", label: "OpenAI · gpt-5" },
+  { value: "openai:gpt-5-mini", label: "OpenAI · gpt-5-mini" },
+  { value: "openai:gpt-5.5", label: "OpenAI · gpt-5.5" },
+  { value: "openai:gpt-5.5-mini", label: "OpenAI · gpt-5.5-mini" },
+  { value: "openai:gpt-5.5-nano", label: "OpenAI · gpt-5.5-nano" },
+];
+
+function formatUptime(s: number): string {
+  if (s == null || s < 0) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${String(sec).padStart(2, "0")}s`;
+  return `${sec}s`;
+}
+
+// Live system heartbeat in the sidebar: status dot, uptime, and click-to-expand
+// health checks + plain-language problems (what / why / how to fix).
+function SystemPulse({ pulse, online }: { pulse: any; online: boolean }) {
+  const [open, setOpen] = useState(false);
+  const status: string = !online ? "down" : (pulse?.status ?? "healthy");
+  const tone = status === "healthy" ? "ok" : status === "degraded" ? "warn" : "bad";
+  const label = !online ? "Backend offline"
+    : status === "healthy" ? "All systems healthy"
+    : status === "degraded" ? "Running — check issues"
+    : "System problem";
+  const problems: any[] = online ? (pulse?.problems ?? []) : [{
+    what: "Backend is not responding",
+    why: "The local backend (port 8001) is down or restarting — usually after running out of memory/disk, a heavy job, or a manual stop.",
+    fix: "It reconnects automatically when it's back. If it stays offline, restart it: cd backend && python3 -m uvicorn app.main:app --port 8001",
+  }];
+  const checks: any[] = online ? (pulse?.checks ?? []) : [];
+  return (
+    <div className={`pulse pulse-${tone}`}>
+      <button className="pulse-head" type="button" onClick={() => setOpen(o => !o)} title="System health — click for details">
+        <span className="pulse-dot" />
+        <span className="pulse-label">{label}</span>
+        {problems.length > 0 && <span className="pulse-badge">{problems.length}</span>}
+        <ChevronRight size={13} className={`pulse-caret ${open ? "open" : ""}`} />
+      </button>
+      <div className="pulse-uptime">{online && pulse ? `Uptime ${formatUptime(pulse.uptime_seconds)}` : "Reconnecting…"}</div>
+      {open && (
+        <div className="pulse-details">
+          {checks.map((c) => (
+            <div key={c.key} className={`pulse-check sev-${c.severity || (c.ok ? "ok" : "bad")}`}>
+              <span className="pulse-check-dot" />
+              <b>{c.label}</b><span>{c.detail}</span>
+            </div>
+          ))}
+          {problems.map((p, i) => (
+            <div key={i} className="pulse-problem">
+              <div className="pp-what"><AlertTriangle size={12} /> {p.what}</div>
+              <div className="pp-why">{p.why}</div>
+              <div className="pp-fix"><Check size={12} /> {p.fix}</div>
+            </div>
+          ))}
+          {online && problems.length === 0 && <div className="pulse-allgood"><CheckCircle2 size={13} /> No problems detected.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Unified, friendly progress stepper for the Create Voice flow.
+const WIZARD_STEPS = ["Details", "Consent", "Record", "Publish"];
+function WizardStepper({ current }: { current: number }) {
+  return (
+    <div className="wizard-progress" role="list" aria-label="Voice creation progress">
+      {WIZARD_STEPS.map((label, i) => {
+        const step = i + 1;
+        const state = step < current ? "done" : step === current ? "active" : "upcoming";
+        return (
+          <div
+            className={`wizard-step ${state}`}
+            role="listitem"
+            aria-current={state === "active" ? "step" : undefined}
+            key={label}
+          >
+            <span className="wizard-step-badge">{state === "done" ? <Check size={14} /> : step}</span>
+            <span className="wizard-step-label">{label}</span>
+            {i < WIZARD_STEPS.length - 1 && <span className="wizard-step-line" aria-hidden="true" />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 const STUDIO_HOWTO = [
   { n: 1, icon: "🎤", title: "Record", desc: "Read a few short sentences aloud in your normal voice." },
   { n: 2, icon: "✨", title: "Build", desc: "The studio cleans your audio and builds an AI voice from it." },
@@ -4231,18 +5083,101 @@ const STUDIO_HOWTO = [
   { n: 4, icon: "🚀", title: "Publish", desc: "Activate the voice so the assistant can speak with it." },
 ];
 
+// Shared status banner for the Voice Studio (busy / ok / error feedback).
+function StudioStatusBanner({ msg, onClose }: { msg: { kind: "ok" | "err" | "busy"; text: string } | null; onClose: () => void }) {
+  if (!msg) return null;
+  return (
+    <div className={`studio-status ${msg.kind}`}>
+      {msg.kind === "busy" ? <RefreshCw size={18} className="spin" />
+        : msg.kind === "ok" ? <CheckCircle2 size={18} />
+        : <CircleAlert size={18} />}
+      <span className="studio-status-text">{msg.text}</span>
+      {msg.kind !== "busy" && (
+        <button className="studio-status-close" onClick={onClose} type="button" aria-label="Dismiss">✕</button>
+      )}
+    </div>
+  );
+}
+
+// Pre-flight readiness — surfaces mic + engine problems BEFORE the user records,
+// so nobody records a dozen takes only to hit an error at build time.
+function RecordingPreflight({
+  micState,
+  engineId,
+  engineInfo,
+}: {
+  micState: "unknown" | "granted" | "denied" | "unavailable";
+  engineId: string;
+  engineInfo: any | null;
+}) {
+  const engineLabel = ENGINE_LABELS[engineId] ?? engineId;
+  const isCloud = engineId === "elevenlabs";
+  // engineInfo === null → status not loaded yet; don't alarm the user.
+  const engineMissing = engineInfo ? engineInfo.installed === false : false;
+
+  const checks: { key: string; state: "ok" | "warn" | "bad" | "idle"; icon: React.ReactNode; label: string; detail: React.ReactNode }[] = [
+    {
+      key: "mic",
+      state: micState === "granted" ? "ok" : micState === "denied" || micState === "unavailable" ? "bad" : "idle",
+      icon: micState === "denied" || micState === "unavailable" ? <MicOff size={16} /> : <Mic size={16} />,
+      label: "Microphone",
+      detail:
+        micState === "granted" ? "Ready — access granted."
+        : micState === "denied" ? "Blocked. Click the 🔒/mic icon in your browser's address bar and allow the microphone, then reload."
+        : micState === "unavailable" ? "No microphone detected, or your browser blocks recording on this page."
+        : "We'll ask for access the first time you hit record — that's normal.",
+    },
+    {
+      key: "engine",
+      state: engineMissing ? "bad" : engineInfo ? "ok" : "idle",
+      icon: engineMissing ? <AlertTriangle size={16} /> : <Cpu size={16} />,
+      label: `Voice engine — ${engineLabel}`,
+      detail: engineMissing ? (
+        <>
+          Not installed yet, so <b>building the voice will fail</b> after you record. Install it first:{" "}
+          {ENGINE_INSTALL_HINT[engineId] ? <code>{ENGINE_INSTALL_HINT[engineId]}</code> : "see the project README"}.
+          {" "}You can still record now and build once it's installed.
+        </>
+      ) : isCloud ? "Cloud engine — make sure your API key is set in Settings before building."
+        : engineInfo ? "Installed and ready to build your voice."
+        : "Checking engine availability…",
+    },
+  ];
+
+  const hasBlocker = checks.some((c) => c.state === "bad");
+  return (
+    <div className={`preflight ${hasBlocker ? "has-issue" : "ready"}`}>
+      <div className="preflight-head">
+        {hasBlocker ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}
+        <strong>{hasBlocker ? "Before you record — a couple of things to fix" : "You're set up to record"}</strong>
+      </div>
+      <div className="preflight-rows">
+        {checks.map((c) => (
+          <div className={`preflight-row ${c.state}`} key={c.key}>
+            <span className="preflight-icon">{c.icon}</span>
+            <span className="preflight-label">{c.label}</span>
+            <span className="preflight-detail">{c.detail}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function VoiceStudioView({
   voices,
   galleryVoices,
   auditLogs,
   onRefresh,
-  onTtsTest
+  onTtsTest,
+  ttsTestingId
 }: {
   voices: VoicesResponse | null;
   galleryVoices: any[];
   auditLogs: any[];
   onRefresh: () => void;
-  onTtsTest: (language: "ne" | "en", voiceId?: string) => void;
+  onTtsTest: (language: "ne" | "en", voiceId?: string) => Promise<void> | void;
+  ttsTestingId: string | null;
 }) {
   const [selectedVoice, setSelectedVoice] = useState<any | null>(null);
   const [cleaningAll, setCleaningAll] = useState(false);
@@ -4272,6 +5207,18 @@ function VoiceStudioView({
   const selectedVoiceIdValue = selectedVoice?.id || selectedVoice?.voice_id;
   const selectedVoiceConsentComplete = selectedVoice?.consent_status === "completed";
 
+  // Live recording feedback (waveform + timer) and pre-flight readiness
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [recordElapsed, setRecordElapsed] = useState(0);
+  const [micState, setMicState] = useState<"unknown" | "granted" | "denied" | "unavailable">("unknown");
+  const [engines, setEngines] = useState<Record<string, any> | null>(null);
+  const [studioMsg, setStudioMsg] = useState<{ kind: "ok" | "err" | "busy"; text: string } | null>(null);
+
   // Load prompts & recordings if a custom voice is selected
   useEffect(() => {
     const voiceId = selectedVoice?.id || selectedVoice?.voice_id;
@@ -4281,7 +5228,105 @@ function VoiceStudioView({
     }
   }, [selectedVoice]);
 
+  // Pre-flight: when the recording step opens, check engine availability and mic
+  // permission up front so issues surface BEFORE the user records anything.
+  useEffect(() => {
+    if (wizardStep !== "recordings") return;
+    getCloningEngines().then(setEngines).catch(() => setEngines(null));
+    let cancelled = false;
+    let permStatus: any = null;
+    const apply = (state: string) =>
+      !cancelled && setMicState(state === "granted" ? "granted" : state === "denied" ? "denied" : "unknown");
+    (async () => {
+      if (!navigator.mediaDevices?.getUserMedia) { if (!cancelled) setMicState("unavailable"); return; }
+      try {
+        const perms: any = navigator.permissions;
+        if (perms?.query) {
+          permStatus = await perms.query({ name: "microphone" as PermissionName });
+          apply(permStatus.state);
+          permStatus.onchange = () => apply(permStatus.state);
+        }
+      } catch { /* Safari/Firefox may not support the 'microphone' permission query */ }
+    })();
+    return () => { cancelled = true; if (permStatus) permStatus.onchange = null; };
+  }, [wizardStep]);
+
+  // Tear down the live waveform + timer + audio graph after a take.
+  const stopRecordingInternals = () => {
+    if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    if (timerRef.current != null) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    analyserRef.current = null;
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+  };
+
+  // Draw an animated frequency-bar waveform from the live mic analyser.
+  const drawWaveform = () => {
+    const canvas = waveCanvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) { rafRef.current = requestAnimationFrame(drawWaveform); return; }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) { rafRef.current = requestAnimationFrame(drawWaveform); return; }
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 320;
+    const cssH = canvas.clientHeight || 64;
+    if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+    }
+    const w = canvas.width, h = canvas.height;
+    const bins = analyser.frequencyBinCount;
+    const data = new Uint8Array(bins);
+    analyser.getByteFrequencyData(data);
+    ctx.clearRect(0, 0, w, h);
+    const bars = 56;
+    const usable = Math.floor(bins * 0.7); // skip the very-high empty bins
+    const barW = w / bars;
+    for (let i = 0; i < bars; i++) {
+      const v = data[Math.floor((i / bars) * usable)] / 255;
+      const bh = Math.max(2 * dpr, v * h * 0.95);
+      const x = i * barW;
+      const grad = ctx.createLinearGradient(0, h, 0, h - bh);
+      grad.addColorStop(0, "rgba(0,166,81,0.45)");
+      grad.addColorStop(1, "#00d36a");
+      ctx.fillStyle = grad;
+      const r = Math.min(barW / 2 - dpr, 3 * dpr);
+      const bx = x + dpr, bw = barW - 2 * dpr, by = h - bh;
+      ctx.beginPath();
+      ctx.moveTo(bx + r, by);
+      ctx.arcTo(bx + bw, by, bx + bw, by + r, r);
+      ctx.lineTo(bx + bw, h);
+      ctx.lineTo(bx, h);
+      ctx.lineTo(bx, by + r);
+      ctx.arcTo(bx, by, bx + r, by, r);
+      ctx.closePath();
+      ctx.fill();
+    }
+    rafRef.current = requestAnimationFrame(drawWaveform);
+  };
+
+  // Tear everything down if the component unmounts mid-recording.
+  useEffect(() => () => stopRecordingInternals(), []);
+
   const [creatingVoice, setCreatingVoice] = useState(false);
+
+  // Wraps onTtsTest with clear busy/done feedback so a slow first-run model
+  // download never looks frozen (and re-clicks can't pile up more downloads).
+  const handleTestVoice = async (language: "ne" | "en", voiceId?: string, isLocalClone = false) => {
+    if (ttsTestingId) return; // a test is already running — ignore extra clicks
+    setStudioMsg({
+      kind: "busy",
+      text: isLocalClone
+        ? "Generating a preview with this voice… the first time, the local voice model (~1–2 GB) downloads, so this can take a few minutes. It only happens once — later previews are quick."
+        : "Generating a quick voice sample…",
+    });
+    try {
+      await onTtsTest(language, voiceId);
+      setStudioMsg({ kind: "ok", text: "Preview ready — playing now. If you can't hear it, check your volume." });
+    } catch (err: any) {
+      setStudioMsg({ kind: "err", text: err?.message || "Couldn't generate a preview. Please try again in a moment." });
+    }
+  };
 
   const handleCreateVoice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -4332,39 +5377,83 @@ function VoiceStudioView({
   };
 
   const handleStartRecord = async (promptId: string) => {
+    if (!selectedVoiceIdValue) {
+      setStudioMsg({ kind: "err", text: "Voice profile ID is missing. Go back to the gallery and reopen this voice." });
+      return;
+    }
+    let stream: MediaStream;
     try {
-      if (!selectedVoiceIdValue) {
-        throw new Error("Voice profile ID is missing. Please go back to gallery and try again.");
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 44100 } });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 44100 } });
+    } catch (err: any) {
+      // Surface the real reason instead of a scary generic alert.
+      const denied = err?.name === "NotAllowedError" || err?.name === "SecurityError";
+      setMicState(denied ? "denied" : "unavailable");
+      setStudioMsg({
+        kind: "err",
+        text: denied
+          ? "Microphone access was blocked. Click the mic / lock icon in your browser's address bar, allow the microphone, then try again."
+          : "No microphone is available. Plug one in (or check your system settings) and try again.",
+      });
+      return;
+    }
+    try {
+      setStudioMsg(null);
+      setMicState("granted");
+      streamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       recorderRef.current = recorder;
       chunksRef.current = [];
       setActivePrompt(promptId);
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
+
+      // Live waveform: tap the mic into an analyser node.
+      try {
+        const AC: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const ctx = new AC();
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.7;
+        source.connect(analyser);
+        audioCtxRef.current = ctx;
+        analyserRef.current = analyser;
+        rafRef.current = requestAnimationFrame(drawWaveform);
+      } catch { /* waveform is non-essential — recording still works without it */ }
+
+      // Live timer.
+      setRecordElapsed(0);
+      const startedAt = Date.now();
+      timerRef.current = window.setInterval(() => {
+        setRecordElapsed(Math.floor((Date.now() - startedAt) / 1000));
+      }, 250);
+
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       recorder.onstop = async () => {
+        stopRecordingInternals();
         const blob = new Blob(chunksRef.current, { type: "audio/wav" });
         try {
           await uploadVoiceRecording(selectedVoiceIdValue, promptId, blob);
           const updated = await getVoiceRecordings(selectedVoiceIdValue);
           setRecordings(updated);
         } catch (err: any) {
-          alert(err.message || "Failed to upload recording");
+          setStudioMsg({ kind: "err", text: err.message || "Couldn't save that recording. Please try again." });
         }
         setActivePrompt(null);
+        setRecordElapsed(0);
       };
       recorder.start();
     } catch (err: any) {
-      alert("Microphone permission denied or unavailable");
+      stopRecordingInternals();
+      setActivePrompt(null);
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't start recording. Please try again." });
     }
   };
 
   const handleStopRecord = () => {
     if (recorderRef.current && recorderRef.current.state === "recording") {
-      recorderRef.current.stop();
-      recorderRef.current.stream.getTracks().forEach(track => track.stop());
+      recorderRef.current.stop(); // onstop tears down internals + uploads
+    } else {
+      stopRecordingInternals();
+      setActivePrompt(null);
     }
   };
 
@@ -4377,7 +5466,7 @@ function VoiceStudioView({
       const updated = await getVoiceRecordings(selectedVoiceIdValue);
       setRecordings(updated);
     } catch (err: any) {
-      alert(err.message);
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't delete that recording." });
     }
   };
 
@@ -4387,23 +5476,23 @@ function VoiceStudioView({
       setCleaningAll(true);
       const toClean = recordings.filter(r => r.exists);
       if (toClean.length === 0) {
-        alert("No recordings to clean yet. Record some samples first.");
+        setStudioMsg({ kind: "err", text: "No recordings to clean yet — record a few samples first." });
         return;
       }
+      setStudioMsg({ kind: "busy", text: `Cleaning ${toClean.length} recording${toClean.length > 1 ? "s" : ""} — removing noise, trimming silence, normalizing loudness…` });
       for (const rec of toClean) {
         await cleanRecording(selectedVoiceIdValue, rec.id);
       }
-      alert("All recordings have been cleaned and normalized successfully!");
       const updated = await getVoiceRecordings(selectedVoiceIdValue);
       setRecordings(updated);
+      setStudioMsg({ kind: "ok", text: "All recordings cleaned and normalized. They're ready to build a voice." });
     } catch (err: any) {
-      alert(err.message || "Failed to clean recordings.");
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't clean the recordings. Please try again." });
     } finally {
       setCleaningAll(false);
     }
   };
 
-  const [studioMsg, setStudioMsg] = useState<{ kind: "ok" | "err" | "busy"; text: string } | null>(null);
   const [publishing, setPublishing] = useState(false);
 
   const refreshSelectedVoice = async () => {
@@ -4433,6 +5522,7 @@ function VoiceStudioView({
     if (!selectedVoiceIdValue) return;
     try {
       setPreviewingVoice(true);
+      setStudioMsg({ kind: "busy", text: "Generating a preview… the first run may download the voice model, so give it a moment." });
       // Chatterbox downloads ~1-2GB model on first use — no browser fetch timeout
       const controller = new AbortController();
       const resp = await fetch(`${API_HTTP}/voices/${selectedVoiceIdValue}/preview`, {
@@ -4448,9 +5538,10 @@ function VoiceStudioView({
       const audio = new Audio(url);
       audio.play();
       audio.onended = () => URL.revokeObjectURL(url);
+      setStudioMsg({ kind: "ok", text: "Playing a preview with your cloned voice." });
     } catch (err: any) {
       if (err.name === "AbortError") return;
-      alert(err.message || "Failed to preview cloned voice");
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't generate a preview. Try building the voice again." });
     } finally {
       setPreviewingVoice(false);
     }
@@ -4545,7 +5636,7 @@ function VoiceStudioView({
   }, {});
 
   return (
-    <section className="view-stack">
+    <section className="view-stack voice-studio-view">
       {wizardStep === "gallery" && (
         <>
           <div className="view-header">
@@ -4565,6 +5656,9 @@ function VoiceStudioView({
               </button>
             </div>
           </div>
+
+          {/* Test/preview feedback — never leave a click looking frozen */}
+          <StudioStatusBanner msg={studioMsg} onClose={() => setStudioMsg(null)} />
 
           {/* Friendly intro + how it works */}
           <div className="studio-hero">
@@ -4634,61 +5728,65 @@ function VoiceStudioView({
           <div className="voice-studio-grid">
             {/* Built-in Voices — ready instantly, no recording needed */}
             {showBuiltins && builtinLangOk("ne") && (
-            <article className="status-card voice-studio-card">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <ShieldCheck size={20} color="#48bb78" />
+            <article className="voice-studio-card">
+              <div className="voice-card-header">
+                <ShieldCheck size={20} style={{ color: "var(--green)" }} />
                 <strong>Nepali chitwan</strong>
-                <span className="pill good" style={{ marginLeft: "auto" }}>Ready</span>
+                <span className="pill good">Ready</span>
               </div>
-              <span className="muted">Built-in · rhasspy/piper-voices</span>
-              <span style={{ fontSize: 11.5, color: "var(--muted)", lineHeight: 1.5 }}>
+              <span className="voice-card-desc">
                 A natural Nepali voice you can use right away — no recording or setup required.
               </span>
               <div className="pill-group">
-                <span className="pill good">ne</span>
-                <span className="pill">piper</span>
-                <span className="pill good">commercial OK</span>
+                <span className="pill good">Nepali</span>
+                <span className="pill">Piper · built-in</span>
+                <span className="pill good">Commercial OK</span>
               </div>
-              <button className="icon-text" onClick={() => onTtsTest("ne")} type="button"
-                title="Hear a short sample spoken in this Nepali voice.">
-                <Volume2 size={16} />
-                <span>Hear a sample</span>
-              </button>
+              <div className="voice-card-actions">
+                <button className="voice-action-secondary" onClick={() => handleTestVoice("ne")} type="button"
+                  disabled={!!ttsTestingId}
+                  title="Hear a short sample spoken in this Nepali voice.">
+                  {ttsTestingId === "__ne" ? <RefreshCw size={16} className="spin" /> : <Volume2 size={16} />}
+                  <span>{ttsTestingId === "__ne" ? "Playing…" : "Hear a sample"}</span>
+                </button>
+              </div>
             </article>
             )}
 
             {showBuiltins && builtinLangOk("en") && (
-            <article className="status-card voice-studio-card">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <ShieldCheck size={20} color="#48bb78" />
+            <article className="voice-studio-card">
+              <div className="voice-card-header">
+                <ShieldCheck size={20} style={{ color: "var(--green)" }} />
                 <strong>English lessac</strong>
-                <span className="pill good" style={{ marginLeft: "auto" }}>Ready</span>
+                <span className="pill good">Ready</span>
               </div>
-              <span className="muted">Built-in · rhasspy/piper-voices</span>
-              <span style={{ fontSize: 11.5, color: "var(--muted)", lineHeight: 1.5 }}>
+              <span className="voice-card-desc">
                 A clear English voice ready to use instantly — perfect for a quick start.
               </span>
               <div className="pill-group">
-                <span className="pill good">en</span>
-                <span className="pill">piper</span>
-                <span className="pill good">commercial OK</span>
+                <span className="pill good">English</span>
+                <span className="pill">Piper · built-in</span>
+                <span className="pill good">Commercial OK</span>
               </div>
-              <button className="icon-text" onClick={() => onTtsTest("en")} type="button"
-                title="Hear a short sample spoken in this English voice.">
-                <Volume2 size={16} />
-                <span>Hear a sample</span>
-              </button>
+              <div className="voice-card-actions">
+                <button className="voice-action-secondary" onClick={() => handleTestVoice("en")} type="button"
+                  disabled={!!ttsTestingId}
+                  title="Hear a short sample spoken in this English voice.">
+                  {ttsTestingId === "__en" ? <RefreshCw size={16} className="spin" /> : <Volume2 size={16} />}
+                  <span>{ttsTestingId === "__en" ? "Playing…" : "Hear a sample"}</span>
+                </button>
+              </div>
             </article>
             )}
 
             {/* Custom Profiles */}
             {filteredGallery.map(cv => (
-              <article key={cv.id} className="status-card voice-studio-card">
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <User size={20} color="#4299e1" />
+              <article key={cv.id} className="voice-studio-card">
+                <div className="voice-card-header">
+                  <User size={20} style={{ color: "var(--blue)" }} />
                   <strong>{cv.name}</strong>
                 </div>
-                <span className="muted">Owner: {cv.owner_name} ({cv.owner_org || "Personal"})</span>
+                <span className="voice-card-desc">Owner: {cv.owner_name} ({cv.owner_org || "Personal"})</span>
                 <div className="pill-group">
                   <span className="pill good">{cv.language}</span>
                   <span className="pill">{cv.engine}</span>
@@ -4696,27 +5794,28 @@ function VoiceStudioView({
                     Consent: {cv.consent_status}
                   </span>
                   <span className={`pill ${cv.publish_status === 'published' ? 'good' : 'warn'}`}>
-                    {cv.publish_status === 'published' ? 'Ready to Use' : 'Needs More Samples'}
+                    {cv.publish_status === 'published' ? 'Ready to use' : 'Needs more samples'}
                   </span>
-                  <span className="pill">Voice Match pending</span>
                   <span className="pill">Quality {Math.round(cv.quality_score ?? 0)}</span>
                 </div>
-                <div style={{ display: 'flex', gap: '0.5rem', width: '100%', marginTop: 'auto', paddingTop: '0.5rem' }}>
-                  <button className="icon-text" onClick={() => onTtsTest(cv.language === "en" ? "en" : "ne", cv.id)} type="button">
-                    <Volume2 size={16} />
-                    <span>Test</span>
+                <div className="voice-card-actions">
+                  <button className="voice-action-secondary"
+                    onClick={() => handleTestVoice(cv.language === "en" ? "en" : "ne", cv.id, (cv.engine || "").includes("chatterbox") || (cv.engine || "").includes("f5") || (cv.engine || "").includes("openvoice") || (cv.engine || "").includes("voxcpm"))}
+                    disabled={!!ttsTestingId} type="button">
+                    {ttsTestingId === cv.id ? <RefreshCw size={16} className="spin" /> : <Volume2 size={16} />}
+                    <span>{ttsTestingId === cv.id ? "Generating…" : "Test"}</span>
                   </button>
                   {cv.publish_status !== 'published' ? (
-                    <button className="icon-text" onClick={() => { setSelectedVoice(cv); setWizardStep(cv.consent_status === "completed" ? "recordings" : "consent"); }} type="button">
+                    <button className="voice-action-primary" onClick={() => { setSelectedVoice(cv); setWizardStep(cv.consent_status === "completed" ? "recordings" : "consent"); }} type="button">
                       <Mic size={16} />
-                      <span>{cv.consent_status === "completed" ? "Continue setup" : "Add consent"}</span>
+                      <span>{cv.consent_status === "completed" ? "Continue" : "Add consent"}</span>
                     </button>
                   ) : (
-                    <span className="pill good" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>
+                    <span className="pill good voice-action-ready">
                       <Check size={14} /> Ready
                     </span>
                   )}
-                  <button className="icon-text danger" onClick={() => handleDeleteVoiceProfile(cv.id)} style={{ marginLeft: 'auto', padding: '0.25rem 0.5rem' }} type="button">
+                  <button className="voice-action-danger" onClick={() => handleDeleteVoiceProfile(cv.id)} type="button" title="Delete this voice profile">
                     <Trash2 size={16} />
                   </button>
                 </div>
@@ -4753,53 +5852,50 @@ function VoiceStudioView({
           </div>
 
           {/* Quick TTS Voices — no training needed */}
-          <div style={{ marginTop: 20 }}>
-            <div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.6, fontWeight: 700, marginBottom: 12 }}>
-              Cloud TTS Voices · OpenAI (instant, no training)
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 10 }}>
-              {[
-                { id: "openai-alloy", label: "Alloy", desc: "Neutral, balanced" },
-                { id: "openai-echo", label: "Echo", desc: "Clear & steady" },
-                { id: "openai-fable", label: "Fable", desc: "Warm, storytelling" },
-                { id: "openai-onyx", label: "Onyx", desc: "Deep, authoritative" },
-                { id: "openai-nova", label: "Nova", desc: "Bright & upbeat" },
-                { id: "openai-shimmer", label: "Shimmer", desc: "Gentle, soothing" },
-              ].map(v => (
-                <div key={v.id} style={{ padding: "12px 14px", borderRadius: 10, border: "1px solid var(--line)", background: "var(--panel)", display: "flex", flexDirection: "column", gap: 6 }}>
-                  <div style={{ fontWeight: 700, fontSize: 13 }}>{v.label}</div>
-                  <div style={{ fontSize: 11, color: "var(--muted)" }}>{v.desc}</div>
-                  <button className="icon-text" style={{ marginTop: 4, padding: "4px 10px", fontSize: 12 }}
-                    onClick={() => onTtsTest("en", v.id)} type="button">
-                    <Volume2 size={13} /><span>Preview</span>
-                  </button>
-                </div>
-              ))}
-            </div>
+          <div className="studio-section-label"><Sparkles size={13} /> Cloud TTS Voices · OpenAI — instant, no training</div>
+          <div className="voice-tts-grid">
+            {[
+              { id: "openai-alloy", label: "Alloy", desc: "Neutral, balanced" },
+              { id: "openai-echo", label: "Echo", desc: "Clear & steady" },
+              { id: "openai-fable", label: "Fable", desc: "Warm, storytelling" },
+              { id: "openai-onyx", label: "Onyx", desc: "Deep, authoritative" },
+              { id: "openai-nova", label: "Nova", desc: "Bright & upbeat" },
+              { id: "openai-shimmer", label: "Shimmer", desc: "Gentle, soothing" },
+            ].map(v => (
+              <div key={v.id} className="voice-tts-card">
+                <strong>{v.label}</strong>
+                <span>{v.desc}</span>
+                <button className="voice-action-secondary" onClick={() => handleTestVoice("en", v.id)} disabled={!!ttsTestingId} type="button">
+                  {ttsTestingId === v.id ? <RefreshCw size={14} className="spin" /> : <Volume2 size={14} />}
+                  <span>{ttsTestingId === v.id ? "Playing…" : "Preview"}</span>
+                </button>
+              </div>
+            ))}
           </div>
 
           {/* Enhanced Audit Log */}
-          <div style={{ marginTop: 24, borderRadius: 12, border: "1px solid var(--line)", overflow: "hidden" }}>
-            <div style={{ padding: "12px 18px", background: "var(--panel)", borderBottom: "1px solid var(--line)", display: "flex", alignItems: "center", gap: 8 }}>
-              <Activity size={15} style={{ color: "var(--teal)" }} />
-              <strong style={{ fontSize: 13 }}>Consent & Audit Log</strong>
-              <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>{auditLogs.length} events</span>
+          <div className="audit-log-container">
+            <div className="audit-log-header">
+              <Activity size={15} />
+              <strong>Consent &amp; Audit Log</strong>
+              <span>{auditLogs.length} events</span>
             </div>
             {auditLogs.length === 0 ? (
-              <div style={{ padding: 24, textAlign: "center", color: "var(--muted)", fontSize: 13 }}>No audit events yet</div>
+              <div className="audit-log-empty">No audit events yet</div>
             ) : (
-              <div style={{ maxHeight: 220, overflowY: "auto" }}>
+              <div className="audit-log-list">
                 {[...auditLogs].reverse().map((log, i) => {
                   const isGood = log.event?.includes("publish") || log.event?.includes("consent") || log.event?.includes("clone");
                   const isWarn = log.event?.includes("delete") || log.event?.includes("error");
+                  const tone = isGood ? "good" : isWarn ? "warn" : "info";
                   return (
-                    <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 18px", borderBottom: i < auditLogs.length - 1 ? "1px solid var(--line)" : "none", background: i % 2 === 0 ? "transparent" : "var(--surface-2)" }}>
-                      <div style={{ width: 8, height: 8, borderRadius: "50%", marginTop: 5, flexShrink: 0, background: isGood ? "var(--green)" : isWarn ? "var(--rose)" : "var(--teal)" }} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: isGood ? "var(--green)" : isWarn ? "var(--rose)" : "var(--ink)" }}>{log.event}</div>
-                        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{log.details}</div>
+                    <div key={i} className="audit-log-entry">
+                      <div className={`audit-log-dot ${tone}`} />
+                      <div className="audit-log-body">
+                        <div className={`audit-log-event ${tone}`}>{log.event}</div>
+                        <div className="audit-log-details">{log.details}</div>
                       </div>
-                      <div style={{ fontSize: 10, color: "var(--muted)", flexShrink: 0, fontFamily: "monospace" }}>{log.timestamp?.slice(0, 16)?.replace("T", " ") ?? ""}</div>
+                      <div className="audit-log-timestamp">{log.timestamp?.slice(0, 16)?.replace("T", " ") ?? ""}</div>
                     </div>
                   );
                 })}
@@ -4810,9 +5906,10 @@ function VoiceStudioView({
       )}
 
       {wizardStep === "identity" && (
-        <form onSubmit={handleCreateVoice} className="status-card voice-wizard-form">
-          <div className="wizard-progress"><span className="active">1 Name</span><span>2 Goal</span><span>3 Consent</span><span>4 Record</span><span>5 Publish</span></div>
-          <h3>Create Voice</h3>
+        <form onSubmit={handleCreateVoice} className="voice-wizard-form">
+          <WizardStepper current={1} />
+          <h3>Create a voice</h3>
+          <p className="wizard-subtitle">Name the voice and confirm who it belongs to. This takes about a minute — nothing is recorded yet.</p>
           <GuideCallout tone="info" icon={<Info size={16} />} title="What happens in this step">
             You're just naming the voice and saying who it belongs to — <b>nothing is recorded yet</b>.
             Next you'll read a few sentences aloud, and the studio turns them into a voice for you.
@@ -4888,19 +5985,20 @@ function VoiceStudioView({
             <span>I confirm I have permission to use this person's voice.</span>
           </label>
           <FieldHint>Required by law and ethics — cloning someone's voice without their consent is not allowed.</FieldHint>
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
-            <button type="button" className="icon-text danger" onClick={() => setWizardStep("gallery")}>Cancel</button>
-            <button type="submit" className="icon-text good" style={{ marginLeft: 'auto' }} disabled={creatingVoice}>
-              {creatingVoice ? "Creating…" : "Create & Start Recording →"}
+          <div className="form-action-row">
+            <button type="button" className="icon-text" onClick={() => setWizardStep("gallery")}>Cancel</button>
+            <button type="submit" className="icon-text good" disabled={creatingVoice}>
+              {creatingVoice ? "Creating…" : "Create & start recording →"}
             </button>
           </div>
         </form>
       )}
 
       {wizardStep === "consent" && (
-        <form onSubmit={handleSaveConsent} className="status-card voice-wizard-form">
-          <div className="wizard-progress"><span>1 Name</span><span className="active">2 Consent</span><span>3 Record</span><span>4 Test</span><span>5 Publish</span></div>
+        <form onSubmit={handleSaveConsent} className="voice-wizard-form">
+          <WizardStepper current={2} />
           <h3>Consent &amp; ownership</h3>
+          <p className="wizard-subtitle">A quick signature confirming the owner agreed to have their voice cloned.</p>
           <GuideCallout tone="info" icon={<ShieldCheck size={16} />} title="Why we ask for this">
             A voice is personal — like a fingerprint. This signature is a record that the owner agreed to have
             their voice cloned. It protects both you and them, and it's required before the voice can be built or published.
@@ -4914,9 +6012,9 @@ function VoiceStudioView({
             <input type="text" value={signature} onChange={e => setSignature(e.target.value)} required placeholder="e.g. Kushal Khadka" />
             <FieldHint>Type the full name exactly. This is saved to the audit log with a timestamp as proof of consent.</FieldHint>
           </div>
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
-            <button type="button" className="icon-text danger" onClick={() => setWizardStep("gallery")}>Cancel</button>
-            <button type="submit" className="icon-text good" style={{ marginLeft: 'auto' }}>Sign and Continue</button>
+          <div className="form-action-row">
+            <button type="button" className="icon-text" onClick={() => setWizardStep("gallery")}>Cancel</button>
+            <button type="submit" className="icon-text good">Sign and continue →</button>
           </div>
         </form>
       )}
@@ -4936,24 +6034,15 @@ function VoiceStudioView({
             <button className="icon-text" onClick={() => { setStudioMsg(null); setWizardStep("gallery"); }} type="button">← Back to Gallery</button>
           </div>
 
+          {/* Pre-flight: catch mic / engine issues BEFORE recording, not after */}
+          <RecordingPreflight
+            micState={micState}
+            engineId={selectedVoice?.engine || "chatterbox"}
+            engineInfo={engines ? engines[selectedVoice?.engine || "chatterbox"] : null}
+          />
+
           {/* Live status banner — always visible feedback, no silent failures */}
-          {studioMsg && (
-            <div style={{
-              display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderRadius: 12, marginBottom: 16,
-              background: studioMsg.kind === "ok" ? "rgba(72,187,120,0.12)" : studioMsg.kind === "err" ? "rgba(245,101,101,0.12)" : "rgba(0,166,81,0.12)",
-              border: `1px solid ${studioMsg.kind === "ok" ? "rgba(72,187,120,0.4)" : studioMsg.kind === "err" ? "rgba(245,101,101,0.4)" : "rgba(0,166,81,0.4)"}`,
-            }}>
-              {studioMsg.kind === "busy" ? <RefreshCw size={18} className="spin" style={{ color: "var(--teal)", flexShrink: 0 }} />
-                : studioMsg.kind === "ok" ? <CheckCircle2 size={18} style={{ color: "var(--green)", flexShrink: 0 }} />
-                : <CircleAlert size={18} style={{ color: "var(--rose)", flexShrink: 0 }} />}
-              <span style={{ fontSize: 13, fontWeight: 600, flex: 1, color: studioMsg.kind === "ok" ? "var(--green)" : studioMsg.kind === "err" ? "var(--rose)" : "var(--ink)" }}>
-                {studioMsg.text}
-              </span>
-              {studioMsg.kind !== "busy" && (
-                <button style={{ background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: 14 }} onClick={() => setStudioMsg(null)}>✕</button>
-              )}
-            </div>
-          )}
+          <StudioStatusBanner msg={studioMsg} onClose={() => setStudioMsg(null)} />
 
           {/* ── 4-STEP PIPELINE ── */}
           {(() => {
@@ -5092,38 +6181,61 @@ function VoiceStudioView({
             {prompts.map((prompt) => {
               const rec = recordings.find(r => r.id === prompt.id);
               const active = activePrompt === prompt.id;
+              const goodLength = recordElapsed >= 2 && recordElapsed <= 12;
               return (
-                <article className="prompt-row" key={prompt.id}>
-                  <div className="prompt-copy">
-                    <span style={{ fontSize: '0.75rem', color: '#718096', marginRight: '0.5rem' }}>{prompt.id}</span>
-                    <strong>{prompt.text}</strong>
-                    <LanguageBadge language={prompt.language} />
+                <article className={active ? "prompt-row recording" : "prompt-row"} key={prompt.id}>
+                  <div className="prompt-row-top">
+                    <div className="prompt-copy">
+                      <span className="prompt-id">{prompt.id}</span>
+                      <strong>{prompt.text}</strong>
+                      <LanguageBadge language={prompt.language} />
+                    </div>
+                    <div className="quality-strip">
+                      {active ? (
+                        <span className="recording-live"><span className="rec-dot" /> Recording…</span>
+                      ) : rec?.exists ? (
+                        <>
+                          <span
+                            className={`quality ${rec.verdict || rec.quality?.verdict || 'review'}`}
+                            title={rec.reason || rec.quality?.reason || ''}
+                          >
+                            {rec.score ?? rec.quality?.score ?? '—'}/100
+                          </span>
+                          <audio src={absoluteAudioUrl(rec.audio_url) || ""} controls />
+                          <button className="icon-text danger record-small" onClick={() => handleDeleteRecord(prompt.id)} type="button" title="Delete and re-record">
+                            <Trash2 size={14} />
+                          </button>
+                        </>
+                      ) : (
+                        <span className="muted">No recording yet</span>
+                      )}
+                      <button
+                        className={active ? "record-small-circle active" : "record-small-circle"}
+                        onClick={active ? handleStopRecord : () => handleStartRecord(prompt.id)}
+                        type="button"
+                        title={active ? "Stop recording" : "Start recording"}
+                        aria-label={active ? "Stop recording" : "Start recording this sentence"}
+                      >
+                        {active ? <Square size={16} /> : <Mic size={16} />}
+                      </button>
+                    </div>
                   </div>
-                  <div className="quality-strip">
-                    {rec?.exists ? (
-                      <>
-                        <span
-                          className={`quality ${rec.verdict || rec.quality?.verdict || 'review'}`}
-                          title={rec.reason || rec.quality?.reason || ''}
-                        >
-                          {rec.score ?? rec.quality?.score ?? '—'}/100
+                  {active && (
+                    <div className="recording-panel">
+                      <canvas ref={waveCanvasRef} className="rec-wave" />
+                      <div className="rec-meta">
+                        <span className={`rec-timer ${goodLength ? "good" : ""}`}>{fmtDuration(recordElapsed)}</span>
+                        <span className="rec-hint">
+                          {recordElapsed < 2 ? "Read the sentence aloud in your normal voice…"
+                            : goodLength ? "Great length — press stop when you finish the sentence."
+                            : "That's plenty — press stop now."}
                         </span>
-                        <audio src={absoluteAudioUrl(rec.audio_url) || ""} controls />
-                        <button className="icon-text danger record-small" onClick={() => handleDeleteRecord(prompt.id)} type="button" title="Delete and re-record">
-                          <Trash2 size={14} />
+                        <button className="rec-stop-btn" onClick={handleStopRecord} type="button">
+                          <Square size={14} /> Stop
                         </button>
-                      </>
-                    ) : (
-                      <span className="muted">No recording yet</span>
-                    )}
-                  </div>
-                  <button
-                    className={active ? "record-small-circle active" : "record-small-circle"}
-                    onClick={active ? handleStopRecord : () => handleStartRecord(prompt.id)}
-                    type="button"
-                  >
-                    {active ? <Square size={16} /> : <Mic size={16} />}
-                  </button>
+                      </div>
+                    </div>
+                  )}
                 </article>
               );
             })}
@@ -6076,7 +7188,7 @@ function SettingsView({
   voices: VoicesResponse | null;
   onSave: (settings: BackendSettings) => void;
   onDelete: () => void;
-  onTtsTest: (language: "ne" | "en", voiceId?: string) => void;
+  onTtsTest: (language: "ne" | "en", voiceId?: string) => Promise<void> | void;
 }) {
   const [draft, setDraft] = useState(settings);
   useEffect(() => setDraft(settings), [settings]);
@@ -6454,8 +7566,8 @@ function SettingsView({
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
               {voices ? (
                 <>
-                  <VoiceCard label="Nepali voice" voice={voices.selected.nepali} onTest={() => onTtsTest("ne", voices.selected.nepali.id)} />
-                  <VoiceCard label="English voice" voice={voices.selected.english} onTest={() => onTtsTest("en", voices.selected.english.id)} />
+                  <VoiceCard label="Nepali voice" voice={voices.selected.nepali} onTest={() => { Promise.resolve(onTtsTest("ne", voices.selected.nepali.id)).catch(() => {}); }} />
+                  <VoiceCard label="English voice" voice={voices.selected.english} onTest={() => { Promise.resolve(onTtsTest("en", voices.selected.english.id)).catch(() => {}); }} />
                 </>
               ) : (
                 <p style={{ color: "var(--muted)", fontSize: 13 }}>Voice registry unavailable</p>

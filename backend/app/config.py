@@ -34,7 +34,14 @@ class Settings:
     app_env: str = "development"
     backend_host: str = "127.0.0.1"
     backend_port: int = 8000
-    cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173")
+    cors_origins: tuple[str, ...] = (
+        "http://localhost:5173", "http://127.0.0.1:5173",
+        "http://localhost:5174", "http://127.0.0.1:5174",
+        "http://localhost:5175", "http://127.0.0.1:5175",
+        "http://localhost:5176", "http://127.0.0.1:5176",
+        "http://localhost:5177", "http://127.0.0.1:5177",
+        "http://localhost:5190", "http://127.0.0.1:5190",
+    )
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:1.7b"
     ollama_fallback_models: tuple[str, ...] = ("qwen3:4b", "llama3.2:3b", "llama3.2:1b")

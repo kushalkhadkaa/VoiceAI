@@ -1,31 +1,47 @@
 # Agent Handoff
 
-Use `/Users/kushalkhadka/Documents/VoiceAI` as the real repo.
+Updated: 2026-06-13 21:27:41 +0545
+
+Use `/Users/kushalkhadka/VoiceAI` as the active working repo. A separate checkout exists at `/Users/kushalkhadka/Documents/VoiceAI`, but the currently working/flawless app was observed running from `/Users/kushalkhadka/VoiceAI`.
+
+Current git state:
+- Branch: `feat/voice-studio-ux`
+- Remote: `origin https://github.com/kushalkhadkaa/VoiceAI.git`
+- Latest pushed commit: `c877798322a91fa6b19f6d59d95888cad5660b8f`
+- `git push origin feat/voice-studio-ux` returned `Everything up-to-date` before this handoff update.
+- Untracked and intentionally not pushed before this docs update: `.claude/` and `docs/RAG_EVAL_REPORT.md`.
 
 Local services observed:
 - Ollama: `http://127.0.0.1:11434`
 - Open WebUI: `http://127.0.0.1:8080`
+- Backend target: `http://127.0.0.1:8001`
 - Frontend dev server target: `http://127.0.0.1:5173`
-- Backend target: `http://127.0.0.1:8000`
+- Backend health: `{"ok":true,"app":"SwarLocal","version":"0.1.0"}`
 
-Recent changes:
-- Replaced fake Piper copy-cloning with real Chatterbox zero-shot clone references and Chatterbox TTS routing.
-- Voice Studio now defaults new clone profiles to Chatterbox; Piper cloning requires `PIPER_TRAIN_COMMAND` to produce a real `.onnx`.
-- Chatterbox is installed in the local `.venv`, model weights are cached under `.local/huggingface`, and CPU synthesis smoke-tested successfully.
-- Added Logs page and browser-persistent app event logs.
-- Fixed Voice Studio consent ID flow so new voices use `voice_id` correctly and pending voices route to consent before recording.
-- Premium dark UI with new Knowledge and Admin pages.
-- Voice screen now has presets, animated orb/waveform, grouped voice selector, chat bubbles, latency panel, and compact system metrics.
-- Voice Studio has friendlier guided workflow framing and Advanced Voice Controls tooltips.
-- Added `make ui-test` for static frontend UX contracts.
-- Strict voice routing response fields and frontend display.
-- Settings UI for `Force selected cloned voice only` and `Allow voice fallback`.
-- Compact system metrics in the voice screen.
-- Validation targets for model, voice, and RAG.
-- Fixed E2E Ollama provider import.
+Latest pushed changes to inspect first:
+- `c877798` system pulse/heartbeat, uptime, and RAG auto-recovery.
+- `52368c7` single-flight guard for heavy jobs to avoid concurrent CPU pile-ups.
+- `0ca2e36` serialized Chatterbox synthesis to stop it jamming the API.
+- `11b7f0f` streaming animated RAG evaluation, fix-in-KB, model and voice pickers.
+- `48aa055` non-blocking TTS so text answers return instantly and speech can be generated on demand.
+- Earlier branch commits include JS-aware RAG crawling, document-scoped evaluation/chat, explicit LLM provider routing, Voice Studio redesign, and Chatterbox audio-save fixes.
+
+Provider/credit status seen through the app:
+- OpenAI API key is configured and masked by the API boundary.
+- OpenAI provider reports available.
+- Gemini API key is empty and Gemini reports unavailable.
+- Open WebUI API key is empty; current settings show `rag_enabled=false`.
+- The local app does not expose actual OpenAI billing/credit balance, only key/provider availability.
+
+Important implementation notes:
+- Voice cloning is consent-first. Do not add workflows that clone another person's voice.
+- Chatterbox is the default local zero-shot voice clone path; keep it CPU-default on this Mac unless the user explicitly wants to retry MPS.
+- Piper fine-tuning/export still requires `PIPER_TRAIN_COMMAND`; do not fake a Piper clone by copying built-in `.onnx` files.
+- Generated audio, recordings, runtime DBs, model caches, and user data belong under `.local/` or explicit export paths and must stay out of git.
 
 Before continuing:
-1. Run `make test` and `make e2e` after backend edits.
-2. Do not treat `make rag-test` as green until Open WebUI API key is configured.
-3. Preserve local voice/audio data under `.local/voices`; do not delete it unless the user asks.
-4. Keep Chatterbox on CPU by default on this Mac; `CHATTERBOX_DEVICE=mps` caused a Metal crash during smoke testing.
+1. Check `git status --short --branch` and confirm you are in `/Users/kushalkhadka/VoiceAI`.
+2. Read the latest branch commits with `git log --oneline main..HEAD`.
+3. Treat `.claude/` as local tool config.
+4. Review `docs/RAG_EVAL_REPORT.md` for privacy before committing it.
+5. After backend edits, run at least `make test` and the relevant smoke target.

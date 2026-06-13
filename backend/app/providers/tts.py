@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from app.services.heavy_jobs import HeavyJobBusy
+
 from app.providers.stt import ProviderUnavailableError
 from app.schemas import LanguageCode
 
@@ -694,10 +696,22 @@ class ChatterboxTTSProvider:
                 generated_audio_path=str(output_path),
             )
 
+        # One cloned-voice synthesis at a time, process-wide. If another is already
+        # running, this raises HeavyJobBusy immediately (caller gets a clear "wait ~Ns"
+        # message) instead of piling up and crashing the backend.
+        from app.services.heavy_jobs import CLONED_VOICE
         segment_paths: list[Path] = []
-        for index, part in enumerate(normalized):
-            segment_path = self.audio_cache_dir / f"{cache_key}.{index}.wav"
-            self._generate_segment(part, reference_path, segment_path)
+        with CLONED_VOICE:
+            # Bilingual consistency: synthesize the WHOLE utterance with ONE model so
+            # the cloned voice does not change timbre between English and Nepali parts.
+            # Pure English uses the English model (best English quality); anything with
+            # Nepali or mixed text uses the multilingual model for the entire text.
+            unified_language: LanguageCode = "en" if languages == {"en"} else \
+                ("ne" if languages == {"ne"} else "mixed")
+            full_text = " ".join(part.text.strip() for part in normalized if part.text.strip())
+            combined = TTSPart(text=full_text, language=unified_language)
+            segment_path = self.audio_cache_dir / f"{cache_key}.0.wav"
+            self._generate_segment(combined, reference_path, segment_path)
             segment_paths.append(segment_path)
 
         if len(segment_paths) == 1:
@@ -751,7 +765,7 @@ class ChatterboxTTSProvider:
             if language_id is not None:
                 kwargs["language_id"] = language_id
             wav = model.generate(part.text.strip(), **kwargs)
-            ta.save(str(output_path), wav, model.sr)
+            self._save_wav(output_path, wav, model.sr)
         except ProviderUnavailableError:
             raise
         except Exception as exc:
@@ -770,11 +784,33 @@ class ChatterboxTTSProvider:
                     if language_id is not None:
                         kwargs["language_id"] = language_id
                     wav = model.generate(part.text.strip(), **kwargs)
-                    ta.save(str(output_path), wav, model.sr)
+                    self._save_wav(output_path, wav, model.sr)
                     return
                 except Exception:
                     pass
             raise ProviderUnavailableError(f"Chatterbox failed to synthesize cloned voice audio: {exc}") from exc
+
+    @staticmethod
+    def _save_wav(output_path: Any, wav: Any, sr: int) -> None:
+        """Write the generated waveform to disk.
+
+        torchaudio 2.11 routes ``save`` through TorchCodec, which needs an
+        ffmpeg build TorchCodec supports (<= 7). On systems with a newer ffmpeg
+        that load fails, so we write via soundfile (libsndfile), which has no
+        such dependency, and only fall back to torchaudio if soundfile is
+        unavailable.
+        """
+        try:
+            import numpy as np
+            import soundfile as sf
+            data = wav.detach().cpu().numpy() if hasattr(wav, "detach") else np.asarray(wav)
+            if data.ndim == 2 and data.shape[0] < data.shape[1]:
+                data = data.T  # (channels, frames) -> (frames, channels)
+            sf.write(str(output_path), data, int(sr))
+            return
+        except Exception:
+            import torchaudio as ta
+            ta.save(str(output_path), wav, int(sr))
 
     def _model_for_language(self, language: LanguageCode, device: str) -> tuple[Any, str | None]:
         if language == "en":
@@ -902,6 +938,10 @@ class TTSRouter:
                 if self.chatterbox_provider is None:
                     raise ValueError("Chatterbox provider is not configured.")
                 return self.chatterbox_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
+            except HeavyJobBusy:
+                # Don't silently swap to another voice — let the caller tell the
+                # user "a cloned voice is already running, please wait".
+                raise
             except Exception as exc:
                 if not fallback_allowed:
                     raise

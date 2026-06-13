@@ -240,6 +240,113 @@ app.mount("/audio/voices", StaticFiles(directory=str(voices_dir)), name="voices-
 app.mount("/audio", StaticFiles(directory=str(settings.piper_audio_cache_dir)), name="audio")
 
 
+# When a heavy job (cloned-voice synthesis, voice build) is already running, any
+# new request to start another is rejected with HTTP 429 and a clear, friendly
+# message — handled in one place so it applies to every endpoint.
+from app.services.heavy_jobs import HeavyJobBusy as _HeavyJobBusy, running_jobs as _running_jobs
+
+
+@app.exception_handler(_HeavyJobBusy)
+async def _heavy_job_busy_handler(_request, exc: _HeavyJobBusy):
+    return JSONResponse(status_code=429, content={"detail": exc.message},
+                        headers={"Retry-After": str(exc.retry_after)})
+
+
+@app.get("/system/busy")
+def system_busy():
+    """What heavy job (if any) is running right now, so the UI can show it."""
+    jobs = _running_jobs()
+    return {"busy": bool(jobs), "running": jobs}
+
+
+import time as _time
+_BACKEND_STARTED = _time.time()
+
+
+@app.get("/system/pulse")
+def system_pulse():
+    """Fast heartbeat for the UI: uptime + lightweight health checks + any active
+    problems with plain-language what/why/how-to-fix. Uses only fast, local checks
+    (no network calls) so it stays responsive even when the machine is busy."""
+    import datetime
+    checks: list[dict] = [{"key": "backend", "label": "Backend API", "ok": True,
+                           "detail": "Responding", "severity": "ok"}]
+    problems: list[dict] = []
+
+    # Knowledge base (in-memory metadata — fast)
+    try:
+        kb_status = kb_service.status()
+        cols = kb_service.list_collections()
+        docs = sum(getattr(c, "document_count", 0) for c in cols)
+        chunks = sum(getattr(c, "chunk_count", 0) for c in cols)
+        rag_ok = len(cols) > 0
+        kb_detail = f"{len(cols)} collection(s) · {docs} docs · {chunks} chunks · {kb_status.get('db_path', 'local KB')}" if rag_ok else (
+            f"No local knowledge bases in {kb_status.get('db_path', 'the current KB path')}."
+        )
+        checks.append({"key": "rag", "label": "Knowledge base", "ok": rag_ok,
+                       "detail": kb_detail,
+                       "severity": "ok" if rag_ok else "info"})
+        if not rag_ok:
+            problems.append({
+                "what": "No indexed knowledge base is loaded",
+                "why": "RAG is not permanently broken; the current backend is looking at an empty local KB path.",
+                "fix": "Create or import a knowledge base in the Knowledge page. If you expected old data, confirm you opened /Users/kushalkhadka/VoiceAI and backend port 8001.",
+            })
+    except Exception as exc:
+        checks.append({"key": "rag", "label": "Knowledge base", "ok": False,
+                       "detail": f"Could not read knowledge bases: {exc}", "severity": "error"})
+        problems.append({"what": "Knowledge base unreadable",
+                         "why": "The RAG metadata store could not be opened.",
+                         "fix": "Restart the backend; if it persists, check .local/swarlocal.db."})
+
+    # Heavy jobs in progress
+    jobs = _running_jobs()
+    if jobs:
+        j = jobs[0]
+        checks.append({"key": "busy", "label": "Heavy job running", "ok": True,
+                       "detail": f"{j['label']} — ~{j['remaining_seconds']}s left", "severity": "warn"})
+
+    # Disk + memory (fast, local)
+    try:
+        total, _used, free = shutil.disk_usage("/")
+        free_gb = round(free / (1024 ** 3), 1)
+        disk_ok = free_gb >= 8
+        checks.append({"key": "disk", "label": "Disk space", "ok": disk_ok,
+                       "detail": f"{free_gb} GB free", "severity": "ok" if disk_ok else "warn"})
+        if not disk_ok:
+            problems.append({"what": f"Low disk space ({free_gb} GB free)",
+                             "why": "Cloned-voice models (~6 GB) and audio cache need room; low disk can crash synthesis and the backend.",
+                             "fix": "Free up disk to 15 GB+ (empty Trash, clear ~/.cache/huggingface of unused models)."})
+    except Exception:
+        pass
+    try:
+        m = system_monitor_service.get_realtime_metrics()
+        ram_free = m.get("ram_available_gb")
+        if ram_free is not None:
+            ram_ok = ram_free >= 1.5
+            checks.append({"key": "memory", "label": "Free memory", "ok": ram_ok,
+                           "detail": f"{ram_free} GB free", "severity": "ok" if ram_ok else "warn"})
+            if not ram_ok:
+                problems.append({"what": f"Low free memory ({ram_free} GB)",
+                                 "why": "Running a local model + cloned-voice synthesis together can exhaust RAM and the OS kills the backend.",
+                                 "fix": "Close other apps, or use OpenAI (cloud) voice/brain instead of local ones."})
+    except Exception:
+        pass
+
+    uptime = int(_time.time() - _BACKEND_STARTED)
+    status = "down" if any(not c["ok"] and c.get("severity") == "error" for c in checks) else \
+             ("degraded" if problems else "healthy")
+    return {
+        "ok": True,
+        "status": status,
+        "uptime_seconds": uptime,
+        "started_at": datetime.datetime.fromtimestamp(_BACKEND_STARTED).isoformat(),
+        "now": datetime.datetime.now().isoformat(),
+        "checks": checks,
+        "problems": problems,
+    }
+
+
 @app.exception_handler(ProviderUnavailableError)
 async def provider_unavailable_handler(_, exc: ProviderUnavailableError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
@@ -941,6 +1048,7 @@ def kb_crawl_site(collection_id: str, payload: dict):
     max_pages = int(payload.get("max_pages", 500))
     same_domain_only = bool(payload.get("same_domain_only", True))
     delay_ms = int(payload.get("delay_ms", 150))
+    render_js = bool(payload.get("render_js", True))
 
     def _stream():
         import json as _json
@@ -951,6 +1059,7 @@ def kb_crawl_site(collection_id: str, payload: dict):
                 max_pages=max_pages,
                 same_domain_only=same_domain_only,
                 delay_ms=delay_ms,
+                render_js=render_js,
             ):
                 yield f"data: {_json.dumps(event)}\n\n"
         except Exception as exc:
@@ -985,17 +1094,27 @@ def kb_rename_document(collection_id: str, doc_id: str, payload: dict):
 
 @app.get("/kb/collections/{collection_id}/documents/{doc_id}/chunks")
 def kb_get_document_chunks(collection_id: str, doc_id: str, limit: int = 5):
-    """Return first N chunks of a document for preview."""
+    """Return chunks of a document (with page numbers) for preview, plus whether
+    the original file is stored so the UI can offer an 'Open original file' link."""
     try:
-        col = kb_service._get_chroma_collection(collection_id)
-        result = col.get(where={"doc_id": doc_id}, limit=limit, include=["documents", "metadatas"])
-        chunks = []
-        for text, meta in zip(result.get("documents", []), result.get("metadatas", [])):
-            chunks.append({"text": text, "chunk_index": meta.get("chunk_index", 0)})
-        chunks.sort(key=lambda c: c["chunk_index"])
-        return {"ok": True, "chunks": chunks}
+        chunks = kb_service.get_document_chunks(collection_id, doc_id, limit=limit)
+        raw_available = kb_service.get_raw_file_path(collection_id, doc_id) is not None
+        return {"ok": True, "chunks": chunks, "raw_available": raw_available}
     except Exception as exc:
         return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+
+
+@app.get("/kb/collections/{collection_id}/documents/{doc_id}/file")
+def kb_get_document_file(collection_id: str, doc_id: str):
+    """Serve the original uploaded file (PDF/docx/txt) so the user can open the
+    exact source. Only available for files uploaded after raw-file storage was
+    added; older documents return 404 (their text is still viewable in-app)."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    path = kb_service.get_raw_file_path(collection_id, doc_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Original file not stored for this document.")
+    return FileResponse(str(path), filename=path.name)
 
 
 @app.post("/kb/query")
@@ -1082,8 +1201,407 @@ def chat_test(payload: ChatTestRequest):
         use_internet=payload.use_internet,
         llm_provider_id=payload.llm_provider_id,
         stt_provider_id=payload.stt_provider_id,
+        document_id=payload.document_id,
+        temperature=payload.temperature,
     )
 
+
+@app.post("/turn/speak")
+def turn_speak(payload: dict):
+    """On-demand TTS for a text answer (so chat text turns return instantly and
+    audio is only synthesized when the user presses Play)."""
+    from fastapi import HTTPException
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required.")
+    voice_id = (payload.get("voice_id") or "").strip() or None
+    parts = [TTSPart(text=chunk, language=lang) for chunk, lang in language_router.split_for_tts(text)]
+    try:
+        fallback_allowed = not getattr(settings, "force_selected_voice", False) and getattr(settings, "fallback_allowed", True)
+        result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
+    except _HeavyJobBusy:
+        raise  # surfaced as a friendly 429 by the global handler
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
+    return {"ok": True, "audio_url": f"/audio/{result.audio_path.name}",
+            "actual_voice_name": result.actual_voice_name, "engine": result.actual_tts_engine}
+
+
+# ── RAG Evaluation: generate questions from a document, answer with one model,
+#    verify the answers with a second model ──────────────────────────────────
+def _extract_json(text: str) -> dict:
+    """Best-effort JSON extraction — tolerates qwen <think> blocks and code fences."""
+    import re
+    if not text:
+        return {}
+    # strip thinking traces / code fences
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = text.replace("```json", "").replace("```", "")
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+    return {}
+
+
+def _eval_gen_provider(provider_id: str | None):
+    pid = provider_id or ("openai" if settings.openai_api_key else "local")
+    return conversation_service._instantiate_provider(pid), pid
+
+
+def _normalized_question(text: str) -> str:
+    import re
+    return re.sub(r"\W+", " ", (text or "").lower()).strip()
+
+
+def _coerce_qas(text: str, limit: int, source_doc: str) -> list[dict]:
+    payload = _extract_json(text)
+    rows = payload.get("qas", []) if isinstance(payload, dict) else []
+    out: list[dict] = []
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        q = (item.get("q") or item.get("question") or "").strip()
+        a = (item.get("a") or item.get("answer") or "").strip()
+        if q and a:
+            out.append({
+                "q": q,
+                "a": a,
+                "source_doc": (item.get("source_doc") or source_doc or "").strip(),
+                "dimension": (item.get("dimension") or "").strip(),
+            })
+        if len(out) >= limit:
+            break
+    return out
+
+
+@app.post("/kb/eval/generate")
+def kb_eval_generate(payload: dict):
+    from fastapi import HTTPException
+    import random
+    import time
+    cid = (payload.get("collection_id") or "").strip()
+    doc_id = (payload.get("document_id") or "").strip() or None
+    n = max(1, min(int(payload.get("n", 5)), 100))
+    answer_style = (payload.get("answer_style") or "detailed").strip().lower()
+    answer_instruction = (
+        "Answers must be complete and useful: use 1-3 concise sentences when the fact needs context; "
+        "short names/numbers are OK only when the question truly asks for a name, title, amount, date, phone, or limit."
+        if answer_style != "short"
+        else "Answers must be short and taken directly from the text."
+    )
+    if not cid:
+        raise HTTPException(status_code=400, detail="collection_id is required.")
+
+    docs = [d for d in kb_service.list_documents(cid) if (not doc_id or d.id == doc_id)]
+    if not docs:
+        raise HTTPException(status_code=400, detail="No documents found in this knowledge base scope.")
+
+    # Spread generation across documents instead of feeding one large first-document-biased blob.
+    rng = random.Random(f"{time.time_ns()}-{cid}-{doc_id or 'all'}")
+    rng.shuffle(docs)
+    doc_payloads: list[dict] = []
+    docs_to_use = docs if doc_id else docs[:min(len(docs), max(1, n))]
+    for d in docs_to_use:
+        per_doc_limit = 80 if doc_id else max(4, min(12, 240 // max(1, len(docs_to_use))))
+        chunks = kb_service.get_document_chunks(cid, d.id, limit=per_doc_limit)
+        chunks = [c for c in chunks if len((c.get("text") or "").strip()) > 80]
+        if not chunks:
+            continue
+        rng.shuffle(chunks)
+        text = "\n\n".join(c["text"] for c in chunks[:8])[:5500]
+        doc_payloads.append({"doc_id": d.id, "filename": d.filename, "text": text})
+
+    if not doc_payloads:
+        raise HTTPException(status_code=400, detail="No indexed text found to generate questions from.")
+
+    total_docs = len(doc_payloads)
+    base = n // total_docs
+    extra = n % total_docs
+    plan = []
+    for idx, item in enumerate(doc_payloads):
+        count = base + (1 if idx < extra else 0)
+        if count > 0:
+            plan.append((item, min(count, 10)))
+    # If n is larger than docs*10, run additional rounds with the same docs.
+    remaining = n - sum(count for _, count in plan)
+    round_idx = 0
+    while remaining > 0 and doc_payloads:
+        item = doc_payloads[round_idx % len(doc_payloads)]
+        count = min(10, remaining)
+        plan.append((item, count))
+        remaining -= count
+        round_idx += 1
+
+    if doc_id:
+        # For a selected document, rotate snippets per batch so repeated generation is not identical.
+        rng.shuffle(plan)
+
+    provider, used = _eval_gen_provider(payload.get("gen_model"))
+    qas: list[dict] = []
+    seen: set[str] = set()
+    last_err = None
+    dimensions = (
+        "Mix question dimensions across the available evidence: product/service definitions, eligibility, limits, fees/charges, steps/processes, documents required, security warnings, contacts/branches, roles/people, dates, exceptions, and policy conditions. "
+        "Do not generate the same template repeatedly."
+    )
+    for source_doc, want in plan:
+        if len(qas) >= n:
+            break
+        prompt = (
+            f"From this Nabil Bank source document, write exactly {want} factual question/answer pairs. "
+            f"Document name: {source_doc['filename']}. {dimensions} "
+            "Every question must be self-contained and name its subject; never use only 'it', 'this', or 'the individual'. "
+            f"{answer_instruction} "
+            'Return ONLY JSON: {"qas":[{"q":"...","a":"...","source_doc":"...","dimension":"..."}]}.\n\n'
+            f"TEXT:\n{source_doc['text']}"
+        )
+        token_budget = min(3500, want * 240 + 500)
+        gen_opts = {"max_tokens": token_budget, "num_predict": token_budget, "temperature": 0.45}
+        for attempt in range(3):
+            try:
+                result = provider.chat(prompt, system_prompt="You output only valid minified JSON. No prose.", options=gen_opts)
+                batch = _coerce_qas(result.text, want, source_doc["filename"])
+                added = 0
+                for qa in batch:
+                    key = _normalized_question(qa["q"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    qas.append(qa)
+                    added += 1
+                    if len(qas) >= n:
+                        break
+                if added:
+                    break
+            except Exception as exc:
+                last_err = exc
+                if attempt == 1:
+                    prompt = prompt.replace(source_doc["text"], source_doc["text"][:2800])
+    if not qas:
+        detail = (f"Could not generate questions (the generation model returned no usable output"
+                  + (f"; last error: {last_err}" if last_err else "")
+                  + "). Try again, pick a specific document, or switch the answer model.")
+        raise HTTPException(status_code=502, detail=detail)
+    return {"ok": True, "count": len(qas), "questions": qas,
+            "collection_id": cid, "document_id": doc_id, "gen_model": used,
+            "documents_used": sorted({q.get("source_doc", "") for q in qas if q.get("source_doc")})}
+
+
+@app.post("/kb/eval/run")
+def kb_eval_run(payload: dict):
+    from fastapi import HTTPException
+    import time
+    cid = (payload.get("collection_id") or "").strip()
+    doc_id = (payload.get("document_id") or "").strip() or None
+    questions = payload.get("questions") or []
+    answer_model = payload.get("answer_model") or "local"
+    verify_model = payload.get("verify_model") or ("openai" if settings.openai_api_key else "local")
+    temperature = payload.get("temperature")
+    voice_id = (payload.get("voice_id") or "").strip() or None
+    if not cid or not questions:
+        raise HTTPException(status_code=400, detail="collection_id and questions are required.")
+
+    verifier = conversation_service._instantiate_provider(verify_model)
+    rows = []
+    counts = {"correct": 0, "partial": 0, "incorrect": 0, "error": 0}
+    for item in questions[:100]:
+        q = (item.get("q") or "").strip()
+        ref = (item.get("a") or "").strip()
+        if not q:
+            continue
+        t0 = time.time()
+        try:
+            ans_resp = conversation_service.handle_text(
+                q, voice_id=voice_id, knowledge_id=cid, document_id=doc_id,
+                llm_provider_id=answer_model, temperature=temperature,
+                synthesize=bool(voice_id),
+            )
+            ans = ans_resp.response or ""
+            rag_used = bool(getattr(ans_resp, "rag_used", False))
+            audio_url = getattr(ans_resp, "audio_url", None)
+        except Exception as exc:
+            ans, rag_used, audio_url = f"(error: {exc})", False, None
+        latency = round(time.time() - t0, 1)
+
+        # Verify with the second model.
+        try:
+            jprompt = (
+                f"QUESTION: {q}\nREFERENCE ANSWER (from the source document): {ref}\n"
+                f"SYSTEM ANSWER: {ans[:1200]}\n\n"
+                'Grade whether the SYSTEM ANSWER is factually correct and consistent with the reference. '
+                '"correct" = right fact; "partial" = on-topic but incomplete; "incorrect" = wrong/refuses/empty. '
+                'Also assign score 0-100 where 100 means fully correct and source-grounded. '
+                'Return ONLY JSON: {"verdict":"correct|partial|incorrect","score":0-100,"reason":"<short>"}'
+            )
+            jres = verifier.chat(jprompt, system_prompt="You are a strict grader. Output only JSON.")
+            jd = _extract_json(jres.text)
+            verdict = jd.get("verdict", "incorrect")
+            score = int(float(jd.get("score", 0)))
+            reason = jd.get("reason", "")
+        except Exception as exc:
+            verdict, score, reason = "error", 0, str(exc)[:80]
+        if verdict not in counts:
+            verdict = "incorrect"
+        score = max(0, min(100, score))
+        counts[verdict] += 1
+        rows.append({"question": q, "reference": ref, "answer": ans, "rag_used": rag_used,
+                     "verdict": verdict, "score": score, "reason": reason, "latency_s": latency, "audio_url": audio_url,
+                     "source_doc": item.get("source_doc"), "dimension": item.get("dimension")})
+
+    n = len(rows) or 1
+    accuracy = round(100 * (counts["correct"] + 0.5 * counts["partial"]) / n, 1)
+    return {"ok": True, "answer_model": answer_model, "verify_model": verify_model,
+            "total": len(rows), "accuracy": accuracy, "counts": counts, "results": rows}
+
+
+def _eval_judge_prompt(q: str, ref: str, ans: str) -> str:
+    return (
+        f"QUESTION: {q}\nREFERENCE ANSWER (from the source document): {ref}\n"
+        f"SYSTEM ANSWER: {ans[:1200]}\n\n"
+        'Grade whether the SYSTEM ANSWER is factually correct and consistent with the reference. '
+        '"correct" = right fact; "partial" = on-topic but incomplete; "incorrect" = wrong/refuses/empty. '
+        'Also assign score 0-100 where 100 means fully correct and source-grounded. '
+        'Return ONLY JSON: {"verdict":"correct|partial|incorrect","score":0-100,"reason":"<short>"}'
+    )
+
+
+@app.post("/kb/eval/run-stream")
+def kb_eval_run_stream(payload: dict):
+    """Same as /kb/eval/run but streams one result at a time (SSE) so the UI can
+    animate progress and reveal each graded answer as it lands."""
+    from fastapi import HTTPException
+    from fastapi.responses import StreamingResponse
+    import time, json as _json
+    cid = (payload.get("collection_id") or "").strip()
+    doc_id = (payload.get("document_id") or "").strip() or None
+    questions = (payload.get("questions") or [])[:100]
+    answer_model = payload.get("answer_model") or "local"
+    verify_model = payload.get("verify_model") or ("openai" if settings.openai_api_key else "local")
+    temperature = payload.get("temperature")
+    voice_id = (payload.get("voice_id") or "").strip() or None
+    if not cid or not questions:
+        raise HTTPException(status_code=400, detail="collection_id and questions are required.")
+
+    def gen():
+        verifier = conversation_service._instantiate_provider(verify_model)
+        counts = {"correct": 0, "partial": 0, "incorrect": 0, "error": 0}
+        valid = [it for it in questions if (it.get("q") or "").strip()]
+        total = len(valid)
+        yield "data: " + _json.dumps({"type": "start", "total": total,
+                                      "answer_model": answer_model, "verify_model": verify_model}) + "\n\n"
+        for idx, item in enumerate(valid, start=1):
+            q = (item.get("q") or "").strip()
+            ref = (item.get("a") or "").strip()
+            t0 = time.time()
+            try:
+                ans_resp = conversation_service.handle_text(
+                    q, voice_id=voice_id, knowledge_id=cid, document_id=doc_id,
+                    llm_provider_id=answer_model, temperature=temperature,
+                    synthesize=bool(voice_id),
+                )
+                ans = ans_resp.response or ""
+                rag_used = bool(getattr(ans_resp, "rag_used", False))
+                audio_url = getattr(ans_resp, "audio_url", None)
+            except Exception as exc:
+                ans, rag_used, audio_url = f"(error: {exc})", False, None
+            latency = round(time.time() - t0, 1)
+            try:
+                jres = verifier.chat(_eval_judge_prompt(q, ref, ans),
+                                     system_prompt="You are a strict grader. Output only JSON.")
+                jd = _extract_json(jres.text)
+                verdict = jd.get("verdict", "incorrect")
+                score = int(float(jd.get("score", 0)))
+                reason = jd.get("reason", "")
+            except Exception as exc:
+                verdict, score, reason = "error", 0, str(exc)[:80]
+            if verdict not in counts:
+                verdict = "incorrect"
+            score = max(0, min(100, score))
+            counts[verdict] += 1
+            done = sum(counts.values())
+            accuracy = round(100 * (counts["correct"] + 0.5 * counts["partial"]) / done, 1) if done else 0
+            row = {"question": q, "reference": ref, "answer": ans, "rag_used": rag_used,
+                   "verdict": verdict, "score": score, "reason": reason, "latency_s": latency, "audio_url": audio_url,
+                   "source_doc": item.get("source_doc"), "dimension": item.get("dimension")}
+            yield "data: " + _json.dumps({"type": "result", "index": idx, "total": total,
+                                          "result": row, "counts": counts, "accuracy": accuracy}) + "\n\n"
+        done = sum(counts.values()) or 1
+        accuracy = round(100 * (counts["correct"] + 0.5 * counts["partial"]) / done, 1)
+        yield "data: " + _json.dumps({"type": "done", "accuracy": accuracy, "counts": counts,
+                                      "answer_model": answer_model, "verify_model": verify_model}) + "\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/kb/eval/correct")
+def kb_eval_correct(payload: dict):
+    """Fix an incorrect answer by injecting a curated Q&A 'golden' fact into the
+    knowledge base. This is the trusted RAG remediation pattern: the corrected
+    pair becomes a high-signal chunk the retriever surfaces for similar questions."""
+    from fastapi import HTTPException
+    import time
+    cid = (payload.get("collection_id") or "").strip()
+    question = (payload.get("question") or "").strip()
+    answer = (payload.get("answer") or "").strip()
+    if not cid or not question or not answer:
+        raise HTTPException(status_code=400, detail="collection_id, question, and answer are required.")
+    text = (
+        "Verified Q&A (curated correction).\n"
+        f"Question: {question}\n"
+        f"Answer: {answer}\n"
+    )
+    filename = f"correction-{int(time.time())}.txt"
+    try:
+        doc = kb_service.ingest_file(cid, text.encode("utf-8"), filename, "text/plain")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not save correction to the knowledge base: {exc}")
+    return {"ok": True, "document_id": getattr(doc, "id", None), "filename": filename}
+
+
+@app.post("/kb/eval/correct-bulk")
+def kb_eval_correct_bulk(payload: dict):
+    """Save multiple verified evaluation corrections as one high-signal document."""
+    from fastapi import HTTPException
+    import time
+    cid = (payload.get("collection_id") or "").strip()
+    rows = payload.get("items") or []
+    if not cid or not isinstance(rows, list) or not rows:
+        raise HTTPException(status_code=400, detail="collection_id and non-empty items are required.")
+    cleaned = []
+    for item in rows[:100]:
+        if not isinstance(item, dict):
+            continue
+        q = (item.get("question") or "").strip()
+        a = (item.get("answer") or "").strip()
+        source = (item.get("source_doc") or "").strip()
+        verdict = (item.get("verdict") or "").strip()
+        if q and a:
+            cleaned.append((q, a, source, verdict))
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="No usable correction rows were provided.")
+    parts = ["Verified Q&A correction pack (curated from RAG evaluation)."]
+    for idx, (q, a, source, verdict) in enumerate(cleaned, start=1):
+        parts.append(
+            f"\nCorrection {idx}\n"
+            f"Source document: {source or 'not specified'}\n"
+            f"Previous verdict: {verdict or 'needs_fix'}\n"
+            f"Question: {q}\n"
+            f"Verified answer: {a}\n"
+        )
+    filename = f"correction-pack-{int(time.time())}.txt"
+    try:
+        doc = kb_service.ingest_file(cid, "\n".join(parts).encode("utf-8"), filename, "text/plain")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not save corrections to the knowledge base: {exc}")
+    return {"ok": True, "count": len(cleaned), "document_id": getattr(doc, "id", None), "filename": filename}
 
 
 @app.get("/chat/history")
@@ -1574,6 +2092,7 @@ async def voice_socket(websocket: WebSocket):
                             llm_provider_id=session_llm_provider_id,
                             session_id=socket_status.get("session_id"),
                             stt_provider_id=session_stt_provider_id,
+                            synthesize=False,  # text returns instantly; audio is on-demand via /turn/speak
                         ),
                     )
                 elif message_type == "audio":
@@ -1761,7 +2280,10 @@ def clone_voice(voice_id: str):
     import uuid
     import time
     from fastapi import HTTPException
-    
+    from app.services.heavy_jobs import VOICE_BUILD
+
+    # Reject a second build immediately (HTTP 429) if one is already running.
+    VOICE_BUILD.__enter__()
     conn = get_db_connection()
     try:
         voice = conn.execute("SELECT * FROM voices WHERE id = ?;", (voice_id,)).fetchone()
@@ -1922,7 +2444,8 @@ def clone_voice(voice_id: str):
         raise HTTPException(status_code=500, detail=f"Cloning failed: {exc}")
     finally:
         conn.close()
-        
+        VOICE_BUILD.__exit__()
+
     return {"ok": True, "job_id": job_id, "status": "completed"}
 
 @app.post("/voices/{voice_id}/preview")
@@ -1930,6 +2453,7 @@ async def preview_cloned_voice(voice_id: str):
     """Synthesize a short test phrase with the cloned voice so the user can hear it."""
     from fastapi import HTTPException
     from fastapi.responses import FileResponse
+    from app.database import get_db_connection
     conn = get_db_connection()
     try:
         voice = conn.execute("SELECT * FROM voices WHERE id = ?;", (voice_id,)).fetchone()
@@ -1941,9 +2465,11 @@ async def preview_cloned_voice(voice_id: str):
         conn.close()
 
     test_text = "Hello! This is how my cloned voice sounds. नमस्ते, यो मेरो क्लोन गरिएको आवाज हो।"
-    parts = language_router.route(test_text)
+    parts = [TTSPart(text=chunk, language=lang) for chunk, lang in language_router.split_for_tts(test_text)]
     try:
         result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=False)
+    except _HeavyJobBusy:
+        raise  # friendly 429 via the global handler
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Preview synthesis failed: {exc}")
     return FileResponse(str(result.audio_path), media_type="audio/wav", filename="preview.wav")

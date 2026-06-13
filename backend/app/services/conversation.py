@@ -78,6 +78,9 @@ class ConversationService:
         llm_provider_id: str | None = None,
         session_id: str | None = None,
         stt_provider_id: str | None = None,
+        document_id: str | None = None,
+        temperature: float | None = None,
+        synthesize: bool = True,
     ) -> ConversationResponse:
         started = time.perf_counter()
         return self._complete_turn(
@@ -90,6 +93,9 @@ class ConversationService:
             llm_provider_id=llm_provider_id,
             session_id=session_id,
             stt_provider_id=stt_provider_id,
+            document_id=document_id,
+            temperature=temperature,
+            synthesize=synthesize,
         )
 
 
@@ -98,18 +104,26 @@ class ConversationService:
         from app.providers.llm_openai import OpenAILLMProvider
         from app.providers.llm_gemini import GeminiLLMProvider
 
-        if provider_id == "openai":
+        # A provider spec may carry an explicit model: "openai:gpt-5", "gemini:gemini-2.0-flash",
+        # "local:llama3:latest". Split off the base provider; the rest is the model override.
+        base = provider_id
+        model_override: str | None = None
+        if ":" in provider_id:
+            base, model_override = provider_id.split(":", 1)
+            model_override = model_override.strip() or None
+
+        if base == "openai":
             return OpenAILLMProvider(
                 api_key=self.settings.openai_api_key,
-                model=self.settings.openai_model or "gpt-4o-mini",
+                model=model_override or self.settings.openai_model or "gpt-4o-mini",
                 temperature=self.settings.cloud_temperature,
                 max_tokens=self.settings.cloud_max_tokens,
                 timeout_seconds=self.settings.cloud_timeout_seconds,
             )
-        elif provider_id == "gemini":
+        elif base == "gemini":
             return GeminiLLMProvider(
                 api_key=self.settings.gemini_api_key,
-                model=self.settings.gemini_model or "gemini-1.5-flash",
+                model=model_override or self.settings.gemini_model or "gemini-1.5-flash",
                 temperature=self.settings.cloud_temperature,
                 max_tokens=self.settings.cloud_max_tokens,
                 timeout_seconds=self.settings.cloud_timeout_seconds,
@@ -162,7 +176,7 @@ class ConversationService:
             "Do not use any other language or script."
         )
 
-    def _retrieve_kb_context(self, query: str, knowledge_id: str | None = None) -> tuple[str, str | None, str | None]:
+    def _retrieve_kb_context(self, query: str, knowledge_id: str | None = None, document_id: str | None = None) -> tuple[str, str | None, str | None]:
         # RAG-first: the banking assistant grounds EVERY turn (text + voice) in the
         # local Nabil Bank knowledge base. Retrieval is NOT gated on rag_enabled.
         # If a specific knowledge_id is selected, search only that collection;
@@ -173,28 +187,29 @@ class ConversationService:
 
         collection_ids: list[str] | None = None
         rag_collection_id: str | None = None
-        if knowledge_id and knowledge_id != "none":
+        # Snapshot which collections actually exist + have indexed chunks.
+        try:
+            indexed = [c.id for c in self.kb_service.list_collections() if getattr(c, "chunk_count", 0) > 0]
+        except Exception as exc:
+            logger.warning("Unable to list KB collections: %s", exc)
+            return "", None, None
+        if not indexed:
+            # Nothing indexed yet — nothing to ground on, proceed without context.
+            return "", None, None
+
+        if knowledge_id and knowledge_id != "none" and knowledge_id in indexed:
             collection_ids = [knowledge_id]
             rag_collection_id = knowledge_id
         else:
-            try:
-                collections = self.kb_service.list_collections()
-                # Only search collections that actually have indexed chunks.
-                collection_ids = [
-                    collection.id
-                    for collection in collections
-                    if getattr(collection, "chunk_count", 0) > 0
-                ]
-                if not collection_ids:
-                    # Nothing indexed yet — nothing to ground on, proceed without context.
-                    return "", None, None
-                rag_collection_id = ",".join(collection_ids)
-            except Exception as exc:
-                logger.warning("Unable to list KB collections: %s", exc)
-                return "", None, None
+            # No selection, or a stale/deleted/invalid id — never silently fail RAG;
+            # fall back to searching every indexed collection.
+            if knowledge_id and knowledge_id != "none" and knowledge_id not in indexed:
+                logger.warning("knowledge_id %r is not an indexed collection; searching all instead.", knowledge_id)
+            collection_ids = indexed
+            rag_collection_id = ",".join(collection_ids)
 
         try:
-            context = self.kb_service.build_context(query, collection_ids)
+            context = self.kb_service.build_context(query, collection_ids, doc_id=document_id)
             return context, "local_kb" if context else None, rag_collection_id if context else None
         except Exception as exc:
             logger.warning("Local KB retrieval failed: %s", exc)
@@ -238,6 +253,9 @@ class ConversationService:
         llm_provider_id: str | None = None,
         session_id: str | None = None,
         stt_provider_id: str | None = None,
+        document_id: str | None = None,
+        temperature: float | None = None,
+        synthesize: bool = True,
     ) -> ConversationResponse:
         input_language = self.language_router.detect(text, whisper_language, whisper_confidence)
         
@@ -259,7 +277,7 @@ class ConversationService:
                 citations = search_results
                 
         modality = "voice" if transcript_ms is not None else "text"
-        knowledge_context, rag_path, rag_collection_id = self._retrieve_kb_context(text, knowledge_id)
+        knowledge_context, rag_path, rag_collection_id = self._retrieve_kb_context(text, knowledge_id, document_id)
         rag_used = bool(knowledge_context)
         llm_input = self._build_llm_input(text, input_language.language, knowledge_context, citations if internet_used else [])
         system_prompt = self._effective_system_prompt(input_language.language, modality)
@@ -274,7 +292,12 @@ class ConversationService:
                 is_cloud_voice = True
 
         target_provider = llm_provider_id or self.settings.llm_provider or "local"
-        if (is_cloud_stt or is_cloud_voice) and target_provider in ("local", "auto"):
+        # Auto-upgrade a default/local selection to cloud only when the caller did
+        # NOT explicitly choose a provider — an explicit llm_provider_id is always
+        # honored. The coupling exists so a cloud STT/voice turn keeps a consistent
+        # cloud LLM; it must not override a deliberate "use the local model" request.
+        explicit_provider = bool(llm_provider_id)
+        if not explicit_provider and (is_cloud_stt or is_cloud_voice) and target_provider in ("local", "auto"):
             actual_provider = "openai"
         else:
             if target_provider == "auto":
@@ -287,28 +310,41 @@ class ConversationService:
             provider_instance = self.llm_provider
         else:
             provider_instance = self._instantiate_provider(actual_provider)
-        
+
+        # Per-turn temperature override (used by the RAG evaluation / doc-chat feature).
+        # Save the original so a one-off override never leaks onto the shared provider.
+        _orig_temperature = getattr(provider_instance, "temperature", None)
+        if temperature is not None and hasattr(provider_instance, "temperature"):
+            try:
+                provider_instance.temperature = float(temperature)
+            except (TypeError, ValueError):
+                pass
+
         rag_fallback_used = False
         fallback_used = False
         fallback_reason = None
         llm_result = None
 
         try:
-            llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
-        except Exception as e:
-            if actual_provider in ("openai", "gemini") and self.settings.cloud_fallback_to_local:
-                fallback_used = True
-                fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local Ollama."
-                actual_provider = "local"
-                provider_instance = self.llm_provider
+            try:
                 llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
-            elif actual_provider == "local" and knowledge_id and knowledge_id != "none" and self.settings.rag_fallback_to_ollama:
-                rag_fallback_used = True
-                fallback_reason = f"Local RAG prompt failed: {e}. Retrying direct local chat."
-                direct_input = self._build_llm_input(text, input_language.language, "", citations if internet_used else [])
-                llm_result = provider_instance.chat(direct_input, system_prompt=system_prompt)
-            else:
-                raise
+            except Exception as e:
+                if actual_provider in ("openai", "gemini") and self.settings.cloud_fallback_to_local:
+                    fallback_used = True
+                    fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local Ollama."
+                    actual_provider = "local"
+                    provider_instance = self.llm_provider
+                    llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
+                elif actual_provider == "local" and knowledge_id and knowledge_id != "none" and self.settings.rag_fallback_to_ollama:
+                    rag_fallback_used = True
+                    fallback_reason = f"Local RAG prompt failed: {e}. Retrying direct local chat."
+                    direct_input = self._build_llm_input(text, input_language.language, "", citations if internet_used else [])
+                    llm_result = provider_instance.chat(direct_input, system_prompt=system_prompt)
+                else:
+                    raise
+        finally:
+            if temperature is not None and _orig_temperature is not None and hasattr(self.llm_provider, "temperature"):
+                self.llm_provider.temperature = _orig_temperature
 
         response_language = self.language_router.detect(llm_result.text)
 
@@ -337,41 +373,43 @@ class ConversationService:
             TTSPart(text=chunk, language=language)
             for chunk, language in self.language_router.split_for_tts(llm_result.text)
         ]
-        
-        # 3. Dynamic voice synthesis
-        fallback_allowed = not getattr(self.settings, "force_selected_voice", False) and getattr(self.settings, "fallback_allowed", True)
-        
-        try:
-            tts_result = self.tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
-        except FallbackBlockedError as exc:
-            raise ValueError(f"Voice synthesis blocked: selected voice cannot be used and fallback is disabled. {exc}") from exc
+
+        # 3. Dynamic voice synthesis — skipped for text turns (synthesize=False) so the
+        #    answer text returns immediately; audio is generated on demand via /turn/speak.
+        tts_result = None
+        if synthesize:
+            fallback_allowed = not getattr(self.settings, "force_selected_voice", False) and getattr(self.settings, "fallback_allowed", True)
+            try:
+                tts_result = self.tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
+            except FallbackBlockedError as exc:
+                raise ValueError(f"Voice synthesis blocked: selected voice cannot be used and fallback is disabled. {exc}") from exc
 
         # Combine fallback triggers and messages
-        combined_fallback = (rag_fallback_used or fallback_used or tts_result.fallback_used)
+        combined_fallback = (rag_fallback_used or fallback_used or (tts_result.fallback_used if tts_result else False))
         combined_fallback_reasons = []
         if fallback_reason:
             combined_fallback_reasons.append(fallback_reason)
-        if tts_result.fallback_reason:
+        if tts_result and tts_result.fallback_reason:
             combined_fallback_reasons.append(tts_result.fallback_reason)
         final_fallback_reason = "; ".join(combined_fallback_reasons) if combined_fallback_reasons else None
 
         total_ms = (time.perf_counter() - started) * 1000
-        
+
         # Sidecar dictionary for commercial provenance
         audio_sidecar = {
             "generated_by": "SwarLocal",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "voice_id": voice_id or "auto",
-            "requested_voice_id": tts_result.requested_voice_id,
-            "requested_voice_name": tts_result.requested_voice_name,
-            "actual_voice_id": tts_result.actual_voice_id,
-            "actual_voice_name": tts_result.actual_voice_name,
-            "actual_tts_engine": tts_result.actual_tts_engine,
-            "model_artifact_path": tts_result.model_artifact_path,
-            "language": tts_result.language,
-            "fallback_used": tts_result.fallback_used,
-            "fallback_reason": tts_result.fallback_reason,
-            "generated_audio_path": tts_result.generated_audio_path,
+            "requested_voice_id": tts_result.requested_voice_id if tts_result else None,
+            "requested_voice_name": tts_result.requested_voice_name if tts_result else None,
+            "actual_voice_id": tts_result.actual_voice_id if tts_result else None,
+            "actual_voice_name": tts_result.actual_voice_name if tts_result else None,
+            "actual_tts_engine": tts_result.actual_tts_engine if tts_result else None,
+            "model_artifact_path": tts_result.model_artifact_path if tts_result else None,
+            "language": tts_result.language if tts_result else None,
+            "fallback_used": tts_result.fallback_used if tts_result else False,
+            "fallback_reason": tts_result.fallback_reason if tts_result else None,
+            "generated_audio_path": tts_result.generated_audio_path if tts_result else None,
             "llm_model": llm_result.model,
             "llm_provider": actual_provider,
             "rag_collection_id": rag_collection_id if rag_used else None,
@@ -380,9 +418,9 @@ class ConversationService:
             "transcript_translation": transcript_translation,
             "response_translation": response_translation,
         }
-        
+
         # Write sidecar to disk next to the audio file if keeping turn audio
-        if self.settings.keep_turn_audio:
+        if synthesize and tts_result and self.settings.keep_turn_audio:
             try:
                 sidecar_path = tts_result.audio_path.with_suffix(".json")
                 sidecar_path.write_text(json.dumps(audio_sidecar, indent=2))
@@ -390,7 +428,8 @@ class ConversationService:
                 pass
 
         # Record usage event
-        self._record_usage_event(audio_sidecar)
+        if synthesize:
+            self._record_usage_event(audio_sidecar)
 
         turn_id = str(uuid.uuid4())
         response_obj = ConversationResponse(
@@ -401,7 +440,7 @@ class ConversationService:
             response_translation=response_translation,
             input_language=input_language.language,
             response_language=response_language.language,
-            audio_url=f"{self.audio_base_url}/{tts_result.audio_path.name}",
+            audio_url=(f"{self.audio_base_url}/{tts_result.audio_path.name}" if tts_result else None),
             tts_route=[{"text": part.text, "language": part.language} for part in parts],
             timings=TimingMetrics(
                 audio_received_to_transcript_ms=transcript_ms,
@@ -410,7 +449,7 @@ class ConversationService:
                 llm_load_ms=llm_result.load_ms,
                 prompt_eval_ms=llm_result.prompt_eval_ms,
                 generation_ms=llm_result.generation_ms,
-                tts_generation_ms=tts_result.generation_ms,
+                tts_generation_ms=(tts_result.generation_ms if tts_result else 0.0),
                 total_turn_ms=total_ms,
             ),
             rag_used=rag_used,
@@ -419,12 +458,12 @@ class ConversationService:
             internet_used=internet_used,
             citations=citations,
             voice_id=voice_id,
-            requested_voice_id=tts_result.requested_voice_id,
-            requested_voice_name=tts_result.requested_voice_name,
-            actual_voice_id=tts_result.actual_voice_id,
-            actual_voice_name=tts_result.actual_voice_name,
-            actual_engine=tts_result.actual_tts_engine,
-            actual_model_path=tts_result.model_artifact_path,
+            requested_voice_id=(tts_result.requested_voice_id if tts_result else None),
+            requested_voice_name=(tts_result.requested_voice_name if tts_result else None),
+            actual_voice_id=(tts_result.actual_voice_id if tts_result else None),
+            actual_voice_name=(tts_result.actual_voice_name if tts_result else None),
+            actual_engine=(tts_result.actual_tts_engine if tts_result else None),
+            actual_model_path=(tts_result.model_artifact_path if tts_result else None),
             fallback_used=combined_fallback,
             fallback_reason=final_fallback_reason,
             audio_sidecar=audio_sidecar,

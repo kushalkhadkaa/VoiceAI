@@ -527,11 +527,35 @@ class RAGService:
         if not text.strip():
             raise ValueError(f"No text could be extracted from {filename!r}")
 
-        return self._ingest_text(
+        doc = self._ingest_text(
             collection_id=collection_id, text=text, filename=filename,
             source_type="file", source_url=None, content_hash=content_hash,
             size_bytes=len(data), tags=tags or [], page_count=page_count,
         )
+        # Keep the original file so the UI can open the exact source (PDF/docx/etc.).
+        try:
+            self._save_raw_file(collection_id, doc.id, filename, data)
+        except Exception as exc:
+            logger.warning("Could not store original KB file for %s: %s", filename, exc)
+        return doc
+
+    def _kb_files_dir(self) -> Path:
+        return self.db_path.parent / "kb_files"
+
+    def _save_raw_file(self, collection_id: str, doc_id: str, filename: str, data: bytes) -> None:
+        ext = Path(filename).suffix or ".bin"
+        dest_dir = self._kb_files_dir() / collection_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / f"{doc_id}{ext}").write_bytes(data)
+
+    def get_raw_file_path(self, collection_id: str, doc_id: str) -> Path | None:
+        d = self._kb_files_dir() / collection_id
+        if not d.exists():
+            return None
+        for p in d.glob(f"{doc_id}.*"):
+            if p.is_file():
+                return p
+        return None
 
     def ingest_url(self, collection_id: str, url: str, tags: list[str] | None = None) -> KBDocument:
         if collection_id not in self._meta:
@@ -564,12 +588,16 @@ class RAGService:
         same_domain_only: bool = True,
         delay_ms: int = 150,
         tags: list[str] | None = None,
+        render_js: bool = True,
     ):
         """Generator that crawls a website and ingests each page.
 
-        Yields dicts with crawl progress. Caller should iterate and stream to client.
-        Each dict has keys: status, url, page, total_queued, doc_id (on success),
-        error (on failure), done (on completion).
+        Renders each page in a headless Chromium (Playwright) so JavaScript / React
+        SPAs are fully painted before extraction; seeds coverage from sitemap.xml;
+        extracts clean main content (header/footer/nav stripped) via trafilatura; and
+        skips pages whose content duplicates an already-ingested page.
+
+        Yields dicts with crawl progress (status/url/page/ingested/failed/done).
         """
         import time as _time
         from urllib.parse import urljoin, urlparse, urldefrag
@@ -582,96 +610,129 @@ class RAGService:
         if not base_domain:
             raise ValueError(f"Invalid start URL: {start_url!r}")
 
+        _SKIP_EXT = (
+            ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".webp", ".pdf",
+            ".zip", ".tar", ".gz", ".mp3", ".mp4", ".wav", ".css", ".js",
+            ".woff", ".woff2", ".ttf", ".xml", ".json",
+        )
+
+        # 1) Seed from sitemap (reliable for large JS sites), then the start URL.
         visited: set[str] = set()
-        queue: list[str] = [start_url]
+        seen_content: set[str] = set()
+        queue: list[str] = []
+        try:
+            for u in _discover_sitemap_urls(start_url, base_domain, limit=max_pages * 2):
+                queue.append(u)
+        except Exception:
+            pass
+        if start_url not in queue:
+            queue.insert(0, start_url)
+        yield {"status": "seeded", "url": start_url, "queued": len(queue),
+               "render_js": render_js, "ingested": 0, "failed": 0}
+
+        # 2) Launch a single headless browser for the whole crawl.
+        pw = browser = context = None
+        if render_js:
+            try:
+                from playwright.sync_api import sync_playwright
+                pw = sync_playwright().start()
+                browser = pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
+                context = browser.new_context(user_agent=_HEADERS["User-Agent"], viewport={"width": 1366, "height": 900})
+            except Exception as exc:
+                logger.warning("Playwright unavailable — falling back to static fetch: %s", exc)
+                pw = browser = context = None
+
         ingested = 0
         failed = 0
+        try:
+            while queue and ingested + failed < max_pages:
+                url = queue.pop(0)
+                url, _ = urldefrag(url)
+                if url in visited:
+                    continue
+                visited.add(url)
 
-        while queue and ingested + failed < max_pages:
-            url = queue.pop(0)
-            url, _ = urldefrag(url)   # strip fragments
-            if url in visited:
-                continue
-            visited.add(url)
+                yield {"status": "crawling", "url": url, "page": ingested + failed + 1,
+                       "total_queued": len(queue) + ingested + failed + 1,
+                       "ingested": ingested, "failed": failed}
 
-            yield {
-                "status": "crawling",
-                "url": url,
-                "page": ingested + failed + 1,
-                "total_queued": len(queue) + ingested + failed + 1,
-                "ingested": ingested,
-                "failed": failed,
-            }
+                try:
+                    link_hrefs: list[str] = []
+                    if context is not None:
+                        page = context.new_page()
+                        try:
+                            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                            try:
+                                page.wait_for_load_state("networkidle", timeout=8000)
+                            except Exception:
+                                pass
+                            page.wait_for_timeout(600)  # let React paint the body
+                            html_str = page.content()
+                            link_hrefs = page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)") or []
+                        finally:
+                            page.close()
+                        raw = html_str.encode("utf-8")
+                    else:
+                        raw, ct = _fetch_url(url, timeout=20)
+                        html_str = raw.decode("utf-8", errors="replace")
+                        link_hrefs = _extract_links(html_str, url)
 
-            try:
-                raw, ct = _fetch_url(url, timeout=20)
-                html_str = raw.decode("utf-8", errors="replace")
-
-                # Extract text
-                if "html" in ct or _looks_html(url):
-                    text = _html_to_text(html_str)
-                    # Extract links from same domain
-                    links = _extract_links(html_str, url)
-                    for link in links:
+                    # Discover same-domain page links.
+                    for link in link_hrefs:
                         link, _ = urldefrag(link)
                         p = urlparse(link)
                         if not p.scheme.startswith("http"):
                             continue
                         if same_domain_only and p.netloc != base_domain:
                             continue
-                        # Skip obviously non-page resources
-                        if any(link.lower().endswith(ext) for ext in (
-                            ".jpg", ".jpeg", ".png", ".gif", ".svg", ".ico", ".webp",
-                            ".pdf", ".zip", ".tar", ".gz", ".mp3", ".mp4", ".wav",
-                            ".css", ".js", ".woff", ".woff2", ".ttf",
-                        )):
+                        if any(link.lower().split("?")[0].endswith(ext) for ext in _SKIP_EXT):
                             continue
                         if link not in visited and link not in queue:
                             queue.append(link)
-                else:
-                    text = html_str
 
-                if not text.strip():
-                    failed += 1
-                    yield {"status": "skipped", "url": url, "reason": "no text extracted",
+                    text = _extract_main_content(html_str, url)
+                    if not text.strip():
+                        failed += 1
+                        yield {"status": "skipped", "url": url, "reason": "no text extracted",
+                               "ingested": ingested, "failed": failed}
+                        continue
+
+                    # Skip pages whose extracted content duplicates another page
+                    # (common for SPA routes that render the same shell).
+                    content_hash = hashlib.sha256(text.strip().encode("utf-8")).hexdigest()
+                    if content_hash in seen_content:
+                        yield {"status": "duplicate", "url": url, "reason": "same content as another page",
+                               "ingested": ingested, "failed": failed}
+                        continue
+                    seen_content.add(content_hash)
+
+                    doc = self._ingest_text(
+                        collection_id=collection_id, text=text, filename=_url_to_filename(url),
+                        source_type="url", source_url=url, content_hash=content_hash,
+                        size_bytes=len(raw), tags=tags or [], page_count=0,
+                    )
+                    ingested += 1
+                    yield {"status": "saved", "url": url, "doc_id": doc.id, "chunks": doc.chunk_count,
+                           "page": ingested + failed, "total_queued": len(queue) + ingested + failed,
                            "ingested": ingested, "failed": failed}
-                    continue
 
-                content_hash = hashlib.sha256(raw).hexdigest()
-                filename = _url_to_filename(url)
+                except Exception as exc:
+                    failed += 1
+                    yield {"status": "error", "url": url, "error": str(exc),
+                           "ingested": ingested, "failed": failed}
 
-                doc = self._ingest_text(
-                    collection_id=collection_id, text=text, filename=filename,
-                    source_type="url", source_url=url, content_hash=content_hash,
-                    size_bytes=len(raw), tags=tags or [], page_count=0,
-                )
-                ingested += 1
-                yield {
-                    "status": "saved",
-                    "url": url,
-                    "doc_id": doc.id,
-                    "chunks": doc.chunk_count,
-                    "page": ingested + failed,
-                    "total_queued": len(queue) + ingested + failed,
-                    "ingested": ingested,
-                    "failed": failed,
-                }
+                if delay_ms > 0:
+                    _time.sleep(delay_ms / 1000.0)
+        finally:
+            try:
+                if browser: browser.close()
+                if pw: pw.stop()
+            except Exception:
+                pass
 
-            except Exception as exc:
-                failed += 1
-                yield {"status": "error", "url": url, "error": str(exc),
-                       "ingested": ingested, "failed": failed}
-
-            if delay_ms > 0:
-                _time.sleep(delay_ms / 1000.0)
-
-        yield {
-            "status": "done",
-            "start_url": start_url,
-            "ingested": ingested,
-            "failed": failed,
-            "total_visited": len(visited),
-        }
+        yield {"status": "done", "start_url": start_url, "ingested": ingested,
+               "failed": failed, "total_visited": len(visited),
+               "rendered": context is not None}
 
     def _ingest_text(
         self,
@@ -879,6 +940,7 @@ class RAGService:
         collection_ids: list[str],
         n: int,
         source_type_filter: str | None = None,
+        doc_id_filter: str | None = None,
     ) -> list[KBSearchResult]:
         # Auto-reindex any target collection whose stored embedding dimension no
         # longer matches the active provider, so a provider switch never hard-breaks
@@ -901,9 +963,12 @@ class RAGService:
                 if count == 0:
                     continue
 
-                where_filter = None
+                conds = []
                 if source_type_filter:
-                    where_filter = {"source_type": source_type_filter}
+                    conds.append({"source_type": source_type_filter})
+                if doc_id_filter:
+                    conds.append({"doc_id": doc_id_filter})
+                where_filter = conds[0] if len(conds) == 1 else ({"$and": conds} if conds else None)
 
                 query_kwargs: dict[str, Any] = {
                     "query_embeddings": [query_embedding],
@@ -1128,6 +1193,7 @@ class RAGService:
         mode: str | None = None,
         source_type_filter: str | None = None,
         rerank: bool | None = None,
+        doc_id_filter: str | None = None,
     ) -> list[KBSearchResult]:
         n = n_results or self.max_results
         collections = collection_ids or list(self._meta.keys())
@@ -1135,6 +1201,10 @@ class RAGService:
             return []
 
         search_mode = mode or self.search_mode
+        # Document-scoped retrieval needs the chroma where-filter, which only the
+        # semantic path applies — force semantic mode when a single doc is targeted.
+        if doc_id_filter:
+            search_mode = "semantic"
         do_rerank = rerank if rerank is not None else self.reranking_enabled
 
         t0 = time.time()
@@ -1144,7 +1214,7 @@ class RAGService:
         elif search_mode == "hybrid":
             results = self._hybrid_search_rrf(query_text, collections, n, source_type_filter)
         else:
-            results = self._semantic_search(query_text, collections, n, source_type_filter)
+            results = self._semantic_search(query_text, collections, n, source_type_filter, doc_id_filter)
 
         if do_rerank and results:
             results = self._rerank(query_text, results)
@@ -1198,8 +1268,8 @@ class RAGService:
             "context": self._build_context_from_results(results),
         }
 
-    def build_context(self, query_text: str, collection_ids: list[str] | None = None) -> str:
-        results = self.query(query_text, collection_ids)
+    def build_context(self, query_text: str, collection_ids: list[str] | None = None, doc_id: str | None = None) -> str:
+        results = self.query(query_text, collection_ids, doc_id_filter=doc_id)
         return self._build_context_from_results(results)
 
     def _build_context_from_results(self, results: list[KBSearchResult]) -> str:
@@ -1397,11 +1467,14 @@ class RAGService:
         except ImportError:
             bm25_available = False
 
-        # Cross-encoder availability
+        # Cross-encoder availability. Catch any error, not just ImportError:
+        # sentence-transformers can be installed yet fail to import (e.g. a broken
+        # torchcodec native lib raises OSError), and an optional reranker probe must
+        # never take down the whole KB status endpoint.
         try:
             from sentence_transformers import CrossEncoder  # noqa: F401
             reranker_available = True
-        except ImportError:
+        except Exception:
             reranker_available = False
 
         return {
@@ -1610,13 +1683,72 @@ def _html_to_text(html: str) -> str:
     try:
         from bs4 import BeautifulSoup
         soup = BeautifulSoup(html, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+        # Strip scripts/styles + common boilerplate containers (header/footer/nav).
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside", "form", "noscript", "svg"]):
             tag.decompose()
-        text = soup.get_text(separator="\n")
+        for sel in ("[role=navigation]", "[role=banner]", "[role=contentinfo]", ".header", ".footer", ".navbar", ".nav", ".menu", ".cookie", ".breadcrumb"):
+            for tag in soup.select(sel):
+                tag.decompose()
+        # Prefer the main content region when the page marks one.
+        main = soup.find("main") or soup.find("article") or soup.find(attrs={"role": "main"}) or soup.body or soup
+        text = main.get_text(separator="\n")
         return re.sub(r"\n{3,}", "\n\n", text).strip()
     except ImportError:
         text = re.sub(r"<[^>]+>", " ", html)
         return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _extract_main_content(html: str, url: str | None = None) -> str:
+    """Extract clean main content, dropping header/footer/nav boilerplate.
+
+    Uses trafilatura (purpose-built for corpus/RAG extraction) when available,
+    falling back to a structural BeautifulSoup strip."""
+    try:
+        import trafilatura
+        txt = trafilatura.extract(
+            html, include_comments=False, include_tables=True,
+            favor_recall=True, no_fallback=False, url=url,
+        )
+        if txt and txt.strip():
+            return txt.strip()
+    except Exception:
+        pass
+    return _html_to_text(html)
+
+
+def _discover_sitemap_urls(start_url: str, base_domain: str, limit: int = 5000) -> list[str]:
+    """Seed crawl coverage from sitemap.xml / robots.txt — the reliable way to
+    enumerate every page of a JS site without depending on link-following."""
+    from urllib.parse import urljoin, urlparse
+    found: list[str] = []
+    seen_sitemaps: set[str] = set()
+    queue = [urljoin(start_url, "/sitemap.xml"), urljoin(start_url, "/sitemap_index.xml"),
+             urljoin(start_url, "/sitemap-index.xml")]
+    try:
+        raw, _ = _fetch_url(urljoin(start_url, "/robots.txt"), timeout=10)
+        for m in re.findall(r"(?i)sitemap:\s*(\S+)", raw.decode("utf-8", "replace")):
+            queue.append(m.strip())
+    except Exception:
+        pass
+    queue = list(dict.fromkeys(queue))
+    while queue and len(found) < limit:
+        sm = queue.pop(0)
+        if sm in seen_sitemaps:
+            continue
+        seen_sitemaps.add(sm)
+        try:
+            raw, _ = _fetch_url(sm, timeout=15)
+            xml = raw.decode("utf-8", "replace")
+        except Exception:
+            continue
+        for loc in re.findall(r"<loc>\s*([^<\s]+)\s*</loc>", xml):
+            loc = loc.strip()
+            if loc.lower().endswith(".xml"):
+                if loc not in seen_sitemaps:
+                    queue.append(loc)
+            elif urlparse(loc).netloc == base_domain:
+                found.append(loc)
+    return list(dict.fromkeys(found))
 
 
 def _result_to_dict(r: KBSearchResult) -> dict[str, Any]:

@@ -12,6 +12,48 @@ Whether you are query-searching local files, archiving native dialects, or train
 
 ---
 
+## Latest Handoff Snapshot
+
+Updated: 2026-06-13 21:27:41 +0545
+
+Use this checkout as the active working repo:
+
+```text
+/Users/kushalkhadka/VoiceAI
+```
+
+There is also an older sibling checkout at `/Users/kushalkhadka/Documents/VoiceAI`; do not assume it is the live app unless the user explicitly redirects you there.
+
+Current git/runtime state:
+
+* Branch: `feat/voice-studio-ux`
+* Last pushed commit: `c877798322a91fa6b19f6d59d95888cad5660b8f`
+* Remote: `origin https://github.com/kushalkhadkaa/VoiceAI.git`
+* Backend observed running on `http://127.0.0.1:8001`; `make dev` still defaults the backend to `8000`
+* Frontend dev server started on `http://127.0.0.1:5173`
+* Backend health check returned `{"ok":true,"app":"SwarLocal","version":"0.1.0"}`
+* Active settings show OpenAI configured and masked, Gemini empty, Open WebUI API key empty, and `rag_enabled=false`
+
+Latest pushed work on this branch includes:
+
+* Voice Studio redesign with interactive recording, preflight checks, better feedback, and Chatterbox voice test fixes.
+* RAG crawler/evaluation work: JS-aware Playwright rendering, sitemap extraction, document-scoped eval/chat, streaming animated eval, model/voice pickers, and fix-in-KB workflow.
+* Chat latency work: text answers return immediately and TTS can be generated non-blocking/on demand.
+* Reliability work: explicit provider routing, OpenAI retry logic, system pulse/heartbeat, uptime reporting, RAG auto-recovery, heavy-job single-flight guard, and serialized Chatterbox synthesis so CPU-heavy jobs do not jam the API.
+
+Known untracked files intentionally left out of the push:
+
+* `.claude/` is local tool configuration.
+* `docs/RAG_EVAL_REPORT.md` is a useful local eval report, but it contains detailed bank-person/contact answers from the knowledge base; review privacy expectations before committing it.
+
+Current stop point:
+
+* The working branch is pushed and code is current on GitHub.
+* Handoff docs are the main thing being maintained here.
+* Next engineering work should focus on RAG/API-key setup, deciding whether to publish the local RAG eval report, and improving Chatterbox/Piper preview scoring and training progress.
+
+---
+
 ## 🌟 Executive Product Features
 
 ### 1. Hybrid Mixed-Language Routing (Heuristic Script Parsing)

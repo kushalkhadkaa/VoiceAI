@@ -368,6 +368,33 @@ export async function getVoicesPrompts(): Promise<any[]> {
   return response.json();
 }
 
+export async function speakText(text: string, voiceId?: string): Promise<{ ok: boolean; audio_url?: string; actual_voice_name?: string; engine?: string }> {
+  const response = await fetch(`${API_HTTP}/turn/speak`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice_id: voiceId || undefined }),
+  });
+  if (!response.ok) { const d = await response.json().catch(() => null); throw new Error(d?.detail ?? "Speech synthesis failed."); }
+  return response.json();
+}
+
+export async function getSystemPulse(): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const r = await fetch(`${API_HTTP}/system/pulse`, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`pulse ${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+export async function getCloningEngines(): Promise<Record<string, any>> {
+  const response = await fetch(`${API_HTTP}/voices/cloning-engines`);
+  if (!response.ok) {
+    throw new Error("Unable to read voice-cloning engine status.");
+  }
+  return response.json();
+}
+
 export async function getAuditLogs(): Promise<any[]> {
   const response = await fetch(`${API_HTTP}/audit/logs`);
   if (!response.ok) {
@@ -534,6 +561,73 @@ export async function getKBCollectionStats(collectionId: string): Promise<any> {
 export async function exportKBCollection(collectionId: string): Promise<any> {
   const r = await fetch(`${API_HTTP}/kb/collections/${collectionId}/export`);
   return r.ok ? r.json() : null;
+}
+
+// ── RAG Evaluation ──
+export interface EvalQA { q: string; a: string; source_doc?: string; dimension?: string }
+export async function kbEvalGenerate(opts: {
+  collection_id: string; document_id?: string | null; n: number; gen_model?: string; answer_style?: "short" | "detailed";
+}): Promise<{ ok: boolean; count: number; questions: EvalQA[]; gen_model: string; documents_used?: string[] }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/generate`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Question generation failed."); }
+  return r.json();
+}
+
+export interface EvalRow {
+  question: string; reference: string; answer: string; rag_used: boolean;
+  verdict: "correct" | "partial" | "incorrect" | "error"; score?: number; reason: string; latency_s: number; audio_url: string | null;
+  source_doc?: string | null; dimension?: string | null;
+}
+export async function kbEvalRun(opts: {
+  collection_id: string; document_id?: string | null; questions: EvalQA[];
+  answer_model: string; verify_model: string; temperature: number; voice_id?: string | null;
+}): Promise<{ ok: boolean; answer_model: string; verify_model: string; total: number; accuracy: number;
+  counts: Record<string, number>; results: EvalRow[] }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/run`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Evaluation failed."); }
+  return r.json();
+}
+
+// Fix an incorrect/partial answer by injecting a curated Q&A into the knowledge base.
+export async function kbEvalCorrect(opts: {
+  collection_id: string; question: string; answer: string;
+}): Promise<{ ok: boolean; document_id?: string; filename?: string }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/correct`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Could not save correction."); }
+  return r.json();
+}
+
+export async function kbEvalCorrectBulk(opts: {
+  collection_id: string;
+  items: Array<{ question: string; answer: string; source_doc?: string | null; verdict?: string }>;
+}): Promise<{ ok: boolean; count: number; document_id?: string; filename?: string }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/correct-bulk`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Could not save bulk corrections."); }
+  return r.json();
+}
+
+// Chat scoped to a specific document (or whole collection) with model + temperature control.
+export async function chatWithDocument(opts: {
+  text: string; collection_id: string; document_id?: string | null;
+  llm_provider_id: string; temperature: number; voice_id?: string | null;
+}): Promise<any> {
+  const r = await fetch(`${API_HTTP}/chat/test`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text: opts.text, knowledge_id: opts.collection_id, document_id: opts.document_id || undefined,
+      llm_provider_id: opts.llm_provider_id, temperature: opts.temperature, voice_id: opts.voice_id || undefined,
+    }),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Chat failed."); }
+  return r.json();
 }
 
 // ============================================================
