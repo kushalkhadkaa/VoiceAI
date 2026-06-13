@@ -1397,11 +1397,14 @@ class RAGService:
         except ImportError:
             bm25_available = False
 
-        # Cross-encoder availability
+        # Cross-encoder availability. Catch any error, not just ImportError:
+        # sentence-transformers can be installed yet fail to import (e.g. a broken
+        # torchcodec native lib raises OSError), and an optional reranker probe must
+        # never take down the whole KB status endpoint.
         try:
             from sentence_transformers import CrossEncoder  # noqa: F401
             reranker_available = True
-        except ImportError:
+        except Exception:
             reranker_available = False
 
         return {
