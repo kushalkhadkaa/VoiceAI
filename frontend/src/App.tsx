@@ -2416,9 +2416,13 @@ function KnowledgeView({
   const [loadingChunks, setLoadingChunks] = useState(false);
   const [renamingDocId, setRenamingDocId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
-  // When opened from an eval question/answer, highlight the matching source chunk.
-  const [chunkHighlight, setChunkHighlight] = useState<string | null>(null);
   const [genElapsed, setGenElapsed] = useState(0);
+  // Source popup: a clean, opaque modal that opens on top of the eval panel,
+  // shows the source document's text with the answering section highlighted,
+  // and links to the original file when available.
+  const [srcModal, setSrcModal] = useState<{ docId: string; docName: string; match: string; rawAvailable: boolean } | null>(null);
+  const [srcChunks, setSrcChunks] = useState<{ text: string; chunk_index: number; page_number?: number | null }[]>([]);
+  const [srcLoading, setSrcLoading] = useState(false);
 
   // ── Search panel ─────────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState("");
@@ -2595,13 +2599,11 @@ function KnowledgeView({
   const handleStopCrawl = () => { crawlAbortRef.current?.abort(); };
 
   // ── Doc actions ───────────────────────────────────────────────────────────
-  const openDocDetail = async (docId: string, highlight?: string | null) => {
+  const openDocDetail = async (docId: string) => {
     setSelectedDocId(docId);
     setDocChunks([]); setLoadingChunks(true);
-    setChunkHighlight(highlight ?? null);
     if (!selectedCol) return;
-    // Fetch a generous number of chunks so we can locate the exact source section.
-    try { setDocChunks((await getKBDocumentChunks(selectedCol.id, docId, 500)).chunks ?? []); }
+    try { setDocChunks((await getKBDocumentChunks(selectedCol.id, docId, 12)).chunks ?? []); }
     catch (e: any) { setError(e.message); }
     finally { setLoadingChunks(false); }
   };
@@ -2616,23 +2618,30 @@ function KnowledgeView({
     for (const w of words) if (ct.includes(w)) hits++;
     return hits / words.length;
   };
-  const bestChunkIdx = useMemo(() => {
-    if (!chunkHighlight || !docChunks.length) return -1;
+  const srcBestIdx = useMemo(() => {
+    if (!srcModal?.match || !srcChunks.length) return -1;
     let best = -1, bestScore = 0.34;  // require a minimum overlap to avoid false matches
-    docChunks.forEach((c, i) => {
-      const s = _matchScore(c.text || "", chunkHighlight);
+    srcChunks.forEach((c, i) => {
+      const s = _matchScore(c.text || "", srcModal.match);
       if (s > bestScore) { bestScore = s; best = i; }
     });
     return best;
-  }, [chunkHighlight, docChunks]);
+  }, [srcModal, srcChunks]);
 
-  // Open the source document for an eval question/answer and highlight the section.
-  const openSourceForQA = (sourceDoc: string | null | undefined, matchText: string) => {
-    if (!sourceDoc) return;
+  // Open a clean popup showing the source document's text, with the section that
+  // answers the question highlighted — on top of the eval panel (no redirect).
+  const openSourceForQA = async (sourceDoc: string | null | undefined, matchText: string) => {
+    if (!sourceDoc || !selectedCol) return;
     const doc = documents.find(d => d.filename === sourceDoc) || documents.find(d => sourceDoc.includes(d.filename) || d.filename.includes(sourceDoc));
     if (!doc) { setError(`Could not find the source document "${sourceDoc}" in this collection.`); return; }
-    setPanel(null);                       // leave the eval overlay → show the document
-    void openDocDetail(doc.id, matchText);
+    setSrcModal({ docId: doc.id, docName: doc.filename, match: matchText, rawAvailable: false });
+    setSrcChunks([]); setSrcLoading(true);
+    try {
+      const res = await getKBDocumentChunks(selectedCol.id, doc.id, 500);
+      setSrcChunks(res.chunks ?? []);
+      setSrcModal(m => m ? { ...m, rawAvailable: !!(res as any).raw_available } : m);
+    } catch (e: any) { setError(e.message); }
+    finally { setSrcLoading(false); }
   };
 
   const handleDeleteDoc = async (docId: string, e: React.MouseEvent) => {
@@ -2827,13 +2836,13 @@ function KnowledgeView({
     const id = window.setInterval(() => setGenElapsed(Math.floor((Date.now() - start) / 1000)), 250);
     return () => clearInterval(id);
   }, [evalBusy]);
-  // Scroll the highlighted source chunk into view when a doc is opened from eval.
-  const highlightRef = useRef<HTMLDivElement | null>(null);
+  // Scroll the highlighted source chunk into view in the source popup.
+  const srcHighlightRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (bestChunkIdx >= 0 && highlightRef.current) {
-      highlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    if (srcBestIdx >= 0 && srcHighlightRef.current) {
+      srcHighlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
     }
-  }, [bestChunkIdx, docChunks]);
+  }, [srcBestIdx, srcChunks]);
 
   // ── Config save ───────────────────────────────────────────────────────────
   const handleSaveConfig = async () => {
@@ -3384,9 +3393,6 @@ function KnowledgeView({
               <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>
                 Content Chunks ({loadingChunks ? "loading…" : `${docChunks.length} of ${selectedDoc.chunk_count}`})
               </div>
-              {chunkHighlight && bestChunkIdx >= 0 && !loadingChunks && (
-                <div className="chunk-locate-note"><Search size={12} /> Jumped to the section that answers this — highlighted below.</div>
-              )}
               {loadingChunks ? (
                 <div style={{ textAlign: "center", padding: 24, color: "var(--muted)" }}>
                   <RefreshCw size={18} className="spin" />
@@ -3394,18 +3400,12 @@ function KnowledgeView({
               ) : docChunks.length === 0 ? (
                 <div style={{ color: "var(--muted)", fontSize: 13, textAlign: "center", padding: 24 }}>No chunks loaded.</div>
               ) : (
-                docChunks.map((c, ci) => {
-                  const hot = ci === bestChunkIdx;
-                  return (
-                  <div key={c.chunk_index} ref={hot ? highlightRef : undefined} className={`chunk-card${hot ? " chunk-highlight" : ""}`}>
-                    <div className="chunk-card-label">
-                      CHUNK #{c.chunk_index}{c.page_number != null ? ` · page ${c.page_number}` : ""}
-                      {hot && <span className="chunk-hot-badge">★ source of the answer</span>}
-                    </div>
+                docChunks.map(c => (
+                  <div key={c.chunk_index} className="chunk-card">
+                    <div className="chunk-card-label">CHUNK #{c.chunk_index}{c.page_number != null ? ` · page ${c.page_number}` : ""}</div>
                     <p>{c.text}</p>
                   </div>
-                  );
-                })
+                ))
               )}
             </div>
           </div>
@@ -3826,6 +3826,51 @@ function KnowledgeView({
                   <input value={docChatInput} onChange={e => setDocChatInput(e.target.value)} placeholder="Ask about this document…" disabled={docChatBusy} />
                   <button type="submit" className="rag-toolbar-btn primary" disabled={docChatBusy || !docChatInput.trim()}><Send size={13} /></button>
                 </form>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Source popup — clean, opaque, on top of the eval panel; highlights the
+            answering section and links to the original file when available. */}
+        {srcModal && selectedCol && (
+          <div className="source-modal-backdrop" onClick={() => setSrcModal(null)}>
+            <div className="source-modal" onClick={e => e.stopPropagation()}>
+              <div className="source-modal-head">
+                <FileText size={16} />
+                <strong title={srcModal.docName}>{srcModal.docName}</strong>
+                {srcModal.rawAvailable && (
+                  <a className="source-open-file" href={`${API_HTTP}/kb/collections/${selectedCol.id}/documents/${srcModal.docId}/file`}
+                    target="_blank" rel="noopener noreferrer">
+                    <Download size={13} /> Open original file
+                  </a>
+                )}
+                <button className="source-modal-close" onClick={() => setSrcModal(null)} title="Close">✕</button>
+              </div>
+              <div className="source-modal-sub">
+                {srcLoading ? "Loading the source document…"
+                  : srcBestIdx >= 0 ? "The highlighted section is where this answer comes from."
+                  : "Showing the full source document."}
+              </div>
+              <div className="source-modal-body">
+                {srcLoading ? (
+                  <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}><RefreshCw size={20} className="spin" /></div>
+                ) : srcChunks.length === 0 ? (
+                  <div style={{ textAlign: "center", padding: 40, color: "var(--muted)" }}>No content found for this document.</div>
+                ) : (
+                  srcChunks.map((c, ci) => {
+                    const hot = ci === srcBestIdx;
+                    return (
+                      <div key={c.chunk_index} ref={hot ? srcHighlightRef : undefined} className={`chunk-card${hot ? " chunk-highlight" : ""}`}>
+                        <div className="chunk-card-label">
+                          CHUNK #{c.chunk_index}{c.page_number != null ? ` · page ${c.page_number}` : ""}
+                          {hot && <span className="chunk-hot-badge">★ source of the answer</span>}
+                        </div>
+                        <p>{c.text}</p>
+                      </div>
+                    );
+                  })
+                )}
               </div>
             </div>
           </div>

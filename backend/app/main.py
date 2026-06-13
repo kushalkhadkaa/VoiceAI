@@ -1094,17 +1094,27 @@ def kb_rename_document(collection_id: str, doc_id: str, payload: dict):
 
 @app.get("/kb/collections/{collection_id}/documents/{doc_id}/chunks")
 def kb_get_document_chunks(collection_id: str, doc_id: str, limit: int = 5):
-    """Return first N chunks of a document for preview."""
+    """Return chunks of a document (with page numbers) for preview, plus whether
+    the original file is stored so the UI can offer an 'Open original file' link."""
     try:
-        col = kb_service._get_chroma_collection(collection_id)
-        result = col.get(where={"doc_id": doc_id}, limit=limit, include=["documents", "metadatas"])
-        chunks = []
-        for text, meta in zip(result.get("documents", []), result.get("metadatas", [])):
-            chunks.append({"text": text, "chunk_index": meta.get("chunk_index", 0)})
-        chunks.sort(key=lambda c: c["chunk_index"])
-        return {"ok": True, "chunks": chunks}
+        chunks = kb_service.get_document_chunks(collection_id, doc_id, limit=limit)
+        raw_available = kb_service.get_raw_file_path(collection_id, doc_id) is not None
+        return {"ok": True, "chunks": chunks, "raw_available": raw_available}
     except Exception as exc:
         return JSONResponse(status_code=400, content={"ok": False, "detail": str(exc)})
+
+
+@app.get("/kb/collections/{collection_id}/documents/{doc_id}/file")
+def kb_get_document_file(collection_id: str, doc_id: str):
+    """Serve the original uploaded file (PDF/docx/txt) so the user can open the
+    exact source. Only available for files uploaded after raw-file storage was
+    added; older documents return 404 (their text is still viewable in-app)."""
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    path = kb_service.get_raw_file_path(collection_id, doc_id)
+    if not path:
+        raise HTTPException(status_code=404, detail="Original file not stored for this document.")
+    return FileResponse(str(path), filename=path.name)
 
 
 @app.post("/kb/query")

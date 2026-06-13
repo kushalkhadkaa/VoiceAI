@@ -527,11 +527,35 @@ class RAGService:
         if not text.strip():
             raise ValueError(f"No text could be extracted from {filename!r}")
 
-        return self._ingest_text(
+        doc = self._ingest_text(
             collection_id=collection_id, text=text, filename=filename,
             source_type="file", source_url=None, content_hash=content_hash,
             size_bytes=len(data), tags=tags or [], page_count=page_count,
         )
+        # Keep the original file so the UI can open the exact source (PDF/docx/etc.).
+        try:
+            self._save_raw_file(collection_id, doc.id, filename, data)
+        except Exception as exc:
+            logger.warning("Could not store original KB file for %s: %s", filename, exc)
+        return doc
+
+    def _kb_files_dir(self) -> Path:
+        return self.db_path.parent / "kb_files"
+
+    def _save_raw_file(self, collection_id: str, doc_id: str, filename: str, data: bytes) -> None:
+        ext = Path(filename).suffix or ".bin"
+        dest_dir = self._kb_files_dir() / collection_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / f"{doc_id}{ext}").write_bytes(data)
+
+    def get_raw_file_path(self, collection_id: str, doc_id: str) -> Path | None:
+        d = self._kb_files_dir() / collection_id
+        if not d.exists():
+            return None
+        for p in d.glob(f"{doc_id}.*"):
+            if p.is_file():
+                return p
+        return None
 
     def ingest_url(self, collection_id: str, url: str, tags: list[str] | None = None) -> KBDocument:
         if collection_id not in self._meta:

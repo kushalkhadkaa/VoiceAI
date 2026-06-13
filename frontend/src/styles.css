@@ -2838,6 +2838,38 @@ button.primary:hover:not(:disabled), button.good:hover:not(:disabled), .icon-tex
 @keyframes chunk-flash { 0%,100% { background: rgba(245,197,24,0.12); } 50% { background: rgba(245,197,24,0.28); } }
 .chunk-hot-badge { margin-left: 8px; font-size: 9.5px; font-weight: 800; color: #7a5c00; background: #f5c518; padding: 1px 7px; border-radius: 999px; text-transform: none; letter-spacing: 0; }
 
+/* Source popup modal (opaque, readable, on top of the eval panel) */
+.source-modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0,0,0,0.6); backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center; padding: 32px;
+  animation: eval-reveal 0.18s ease both;
+}
+.source-modal {
+  width: min(820px, 94vw); max-height: 86vh; display: flex; flex-direction: column;
+  background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
+  box-shadow: 0 24px 70px rgba(0,0,0,0.55); overflow: hidden;
+  animation: src-pop 0.22s cubic-bezier(0.22,1,0.36,1) both;
+}
+@keyframes src-pop { from { opacity: 0; transform: translateY(12px) scale(0.98); } to { opacity: 1; transform: none; } }
+.source-modal-head {
+  display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+  background: var(--panel-2); border-bottom: 1px solid var(--line); flex-shrink: 0;
+}
+.source-modal-head > svg { color: var(--teal); flex-shrink: 0; }
+.source-modal-head strong { flex: 1; min-width: 0; font-size: 14px; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.source-open-file {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 12px; font-weight: 700; color: var(--teal); text-decoration: none;
+  padding: 5px 12px; border: 1px solid rgba(0,166,81,0.4); border-radius: 999px; background: var(--teal-soft);
+  transition: all 0.15s;
+}
+.source-open-file:hover { background: rgba(0,166,81,0.18); border-color: var(--teal); }
+.source-modal-close { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 0 4px; flex-shrink: 0; }
+.source-modal-close:hover { color: var(--ink); }
+.source-modal-sub { padding: 9px 18px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); flex-shrink: 0; }
+.source-modal-body { padding: 16px 18px; overflow-y: auto; }
+
 .eval-row-reveal { animation: eval-reveal 0.45s cubic-bezier(0.22, 1, 0.36, 1) both; }
 @keyframes eval-reveal { from { opacity: 0; transform: translateY(10px) scale(0.99); } to { opacity: 1; transform: none; } }
 
