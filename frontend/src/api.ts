@@ -581,6 +581,17 @@ export async function kbEvalRun(opts: {
   return r.json();
 }
 
+// Fix an incorrect/partial answer by injecting a curated Q&A into the knowledge base.
+export async function kbEvalCorrect(opts: {
+  collection_id: string; question: string; answer: string;
+}): Promise<{ ok: boolean; document_id?: string; filename?: string }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/correct`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Could not save correction."); }
+  return r.json();
+}
+
 // Chat scoped to a specific document (or whole collection) with model + temperature control.
 export async function chatWithDocument(opts: {
   text: string; collection_id: string; document_id?: string | null;

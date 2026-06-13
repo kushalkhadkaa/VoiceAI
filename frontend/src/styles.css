@@ -2699,6 +2699,43 @@ button.primary:hover:not(:disabled), button.good:hover:not(:disabled), .icon-tex
 .eval-row-body { font-size: 12px; color: var(--muted); margin-top: 8px; display: flex; flex-direction: column; gap: 4px; }
 .eval-row-body b { color: var(--ink); font-weight: 600; }
 .eval-reason { font-style: italic; }
+
+/* Animated evaluation progress */
+.eval-progress { margin-top: 16px; padding: 14px 16px; background: var(--surface); border: 1px solid rgba(0,166,81,0.3); border-radius: var(--radius); }
+.eval-progress-head { display: flex; align-items: center; gap: 8px; font-size: 12.5px; color: var(--ink); margin-bottom: 10px; }
+.eval-progress-head b { color: var(--teal); }
+.eval-progress-spinner { display: inline-flex; color: var(--teal); }
+.eval-progress-pct { margin-left: auto; font-weight: 800; font-size: 15px; color: var(--teal); font-variant-numeric: tabular-nums; }
+.eval-progress-track { height: 8px; border-radius: 999px; background: var(--panel-2); overflow: hidden; }
+.eval-progress-fill {
+  height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--teal), #00d36a);
+  background-size: 200% 100%;
+  transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  animation: eval-shimmer 1.4s linear infinite;
+}
+@keyframes eval-shimmer { 0% { background-position: 0% 0; } 100% { background-position: -200% 0; } }
+.eval-progress-dots { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 12px; }
+.eval-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--panel-3, var(--line)); transition: background 0.3s, transform 0.3s; }
+.eval-dot.v-correct { background: var(--green); }
+.eval-dot.v-partial { background: #f59e0b; }
+.eval-dot.v-incorrect, .eval-dot.v-error { background: var(--rose); }
+.eval-dot.active { background: var(--teal); animation: eval-dot-pulse 0.9s ease-in-out infinite; }
+@keyframes eval-dot-pulse { 0%,100% { transform: scale(1); opacity: 1; } 50% { transform: scale(1.5); opacity: 0.5; } }
+
+/* Each graded result slides/fades in as it lands */
+.eval-row-reveal { animation: eval-reveal 0.45s cubic-bezier(0.22, 1, 0.36, 1) both; }
+@keyframes eval-reveal { from { opacity: 0; transform: translateY(10px) scale(0.99); } to { opacity: 1; transform: none; } }
+
+/* Fix-in-KB */
+.eval-row-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.eval-fix-btn { color: var(--amber, #f59e0b); border-color: rgba(245,158,11,0.4); }
+.eval-fixed { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 700; color: var(--green); }
+.eval-fix-editor { margin-top: 10px; padding: 12px; background: var(--panel-2); border: 1px solid rgba(245,158,11,0.35); border-radius: var(--radius-sm); display: flex; flex-direction: column; gap: 8px; animation: eval-reveal 0.3s ease both; }
+.eval-fix-editor label { font-size: 12px; font-weight: 700; color: var(--ink); }
+.eval-fix-editor textarea { width: 100%; resize: vertical; font-size: 13px; padding: 8px 10px; border-radius: var(--radius-sm); border: 1px solid var(--line); background: var(--surface); color: var(--ink); }
+.eval-fix-actions { display: flex; gap: 8px; justify-content: flex-end; }
+.eval-fix-hint { font-size: 11px; color: var(--muted); margin: 0; }
 .doc-chat-log { display: flex; flex-direction: column; gap: 10px; max-height: 280px; overflow-y: auto; padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-sm); margin-bottom: 10px; }
 .doc-chat-empty { font-size: 12px; color: var(--muted); text-align: center; padding: 16px; }
 .doc-chat-msg { display: flex; flex-direction: column; gap: 3px; max-width: 85%; font-size: 12.5px; }

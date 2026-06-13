@@ -104,18 +104,26 @@ class ConversationService:
         from app.providers.llm_openai import OpenAILLMProvider
         from app.providers.llm_gemini import GeminiLLMProvider
 
-        if provider_id == "openai":
+        # A provider spec may carry an explicit model: "openai:gpt-5", "gemini:gemini-2.0-flash",
+        # "local:llama3:latest". Split off the base provider; the rest is the model override.
+        base = provider_id
+        model_override: str | None = None
+        if ":" in provider_id:
+            base, model_override = provider_id.split(":", 1)
+            model_override = model_override.strip() or None
+
+        if base == "openai":
             return OpenAILLMProvider(
                 api_key=self.settings.openai_api_key,
-                model=self.settings.openai_model or "gpt-4o-mini",
+                model=model_override or self.settings.openai_model or "gpt-4o-mini",
                 temperature=self.settings.cloud_temperature,
                 max_tokens=self.settings.cloud_max_tokens,
                 timeout_seconds=self.settings.cloud_timeout_seconds,
             )
-        elif provider_id == "gemini":
+        elif base == "gemini":
             return GeminiLLMProvider(
                 api_key=self.settings.gemini_api_key,
-                model=self.settings.gemini_model or "gemini-1.5-flash",
+                model=model_override or self.settings.gemini_model or "gemini-1.5-flash",
                 temperature=self.settings.cloud_temperature,
                 max_tokens=self.settings.cloud_max_tokens,
                 timeout_seconds=self.settings.cloud_timeout_seconds,

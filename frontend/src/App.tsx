@@ -108,7 +108,7 @@ import {
   getKBCollectionStats,
   exportKBCollection,
   kbEvalGenerate,
-  kbEvalRun,
+  kbEvalCorrect,
   chatWithDocument,
   voiceTurnRest,
   setActiveAIProvider,
@@ -405,7 +405,9 @@ function App() {
       setSpeakingTurnId(turnId ?? turn.response);
       const res = await speakText(turn.response, selectedVoiceId === "auto" ? undefined : selectedVoiceId);
       if (res.audio_url) {
-        setHistory((items) => items.map((t: any) => ((t.id ?? t.response) === (turnId ?? turn.response) ? { ...t, audio_url: res.audio_url } : t)));
+        setHistory((items) => items.map((t: any) => ((t.id ?? t.response) === (turnId ?? turn.response)
+          ? { ...t, audio_url: res.audio_url, actual_voice_name: res.actual_voice_name ?? t.actual_voice_name, actual_engine: res.engine ?? t.actual_engine }
+          : t)));
         handlePlayTurnAudio(res.audio_url);
       }
     } catch (e) {
@@ -540,6 +542,13 @@ function App() {
       stopLevelMeter();
     };
   }, [refreshStatus]);
+
+  // Keep the voice list fresh: refetch when the user opens the Voice tab so that
+  // voices cloned in Voice Studio (e.g. a new clone) appear in the picker without a reload.
+  useEffect(() => {
+    if (activeView !== "conversation") return;
+    getVoices().then((v) => { if (v) setVoices(v); }).catch(() => {});
+  }, [activeView]);
 
   const handleTurn = useCallback(
     async (turn: ConversationTurn) => {
@@ -2295,10 +2304,16 @@ function KnowledgeView({
   // ── Evaluation & document chat ──────────────────────────────────────────
   const [evalDocId, setEvalDocId] = useState<string>("");          // "" = whole collection
   const [evalAnswerModel, setEvalAnswerModel] = useState("local");
-  const [evalVerifyModel, setEvalVerifyModel] = useState("openai");
+  const [evalVerifyModel, setEvalVerifyModel] = useState("openai:gpt-4o-mini");
   const [evalTemp, setEvalTemp] = useState(0.2);
   const [evalN, setEvalN] = useState(5);
   const [evalSpeak, setEvalSpeak] = useState(false);
+  const [evalVoice, setEvalVoice] = useState("openai-alloy");
+  const [evalVoices, setEvalVoices] = useState<any[]>([]);
+  const [evalProgress, setEvalProgress] = useState<{ done: number; total: number } | null>(null);
+  const [evalFixIdx, setEvalFixIdx] = useState<number | null>(null);
+  const [evalFixText, setEvalFixText] = useState("");
+  const [evalFixedQ, setEvalFixedQ] = useState<Set<string>>(new Set());
   const [evalQuestions, setEvalQuestions] = useState<EvalQA[]>([]);
   const [evalResults, setEvalResults] = useState<EvalRow[] | null>(null);
   const [evalSummary, setEvalSummary] = useState<{ accuracy: number; counts: Record<string, number>; answer_model: string; verify_model: string } | null>(null);
@@ -2574,19 +2589,64 @@ function KnowledgeView({
     finally { setEvalBusy(null); }
   };
 
+  // Streaming evaluation: results arrive and animate in one-by-one with a live
+  // progress bar, so a long run never feels frozen.
   const handleRunEval = async () => {
     if (!selectedCol || !evalQuestions.length) return;
-    setEvalBusy("run"); setEvalErr(null);
+    setEvalBusy("run"); setEvalErr(null); setEvalResults([]); setEvalSummary(null);
+    setEvalProgress({ done: 0, total: evalQuestions.length }); setEvalFixIdx(null);
     try {
-      const res = await kbEvalRun({
-        collection_id: selectedCol.id, document_id: evalDocId || null, questions: evalQuestions,
-        answer_model: evalAnswerModel, verify_model: evalVerifyModel, temperature: evalTemp,
-        voice_id: evalSpeak ? "openai-alloy" : null,
+      const resp = await fetch(`${API_HTTP}/kb/eval/run-stream`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          collection_id: selectedCol.id, document_id: evalDocId || null, questions: evalQuestions,
+          answer_model: evalAnswerModel, verify_model: evalVerifyModel, temperature: evalTemp,
+          voice_id: evalSpeak ? evalVoice : null,
+        }),
       });
-      setEvalResults(res.results);
-      setEvalSummary({ accuracy: res.accuracy, counts: res.counts, answer_model: res.answer_model, verify_model: res.verify_model });
+      if (!resp.ok || !resp.body) {
+        const d = await resp.json().catch(() => null);
+        throw new Error(d?.detail ?? "Evaluation failed to start.");
+      }
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const frames = buf.split("\n\n");
+        buf = frames.pop() || "";
+        for (const frame of frames) {
+          const line = frame.split("\n").find(l => l.startsWith("data:"));
+          if (!line) continue;
+          let evt: any;
+          try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+          if (evt.type === "start") {
+            setEvalProgress({ done: 0, total: evt.total });
+          } else if (evt.type === "result") {
+            setEvalResults(prev => [...(prev || []), evt.result]);
+            setEvalProgress({ done: evt.index, total: evt.total });
+            setEvalSummary({ accuracy: evt.accuracy, counts: evt.counts, answer_model: evalAnswerModel, verify_model: evalVerifyModel });
+            if (evalSpeak && evt.result?.audio_url) { try { new Audio(absoluteAudioUrl(evt.result.audio_url) || "").play(); } catch { /* ignore */ } }
+          } else if (evt.type === "done") {
+            setEvalSummary({ accuracy: evt.accuracy, counts: evt.counts, answer_model: evt.answer_model, verify_model: evt.verify_model });
+            setEvalProgress(p => p ? { ...p, done: p.total } : null);
+          }
+        }
+      }
     } catch (e: any) { setEvalErr(e.message); }
     finally { setEvalBusy(null); }
+  };
+
+  const handleFixInKB = async (row: EvalRow, corrected: string) => {
+    if (!selectedCol || !corrected.trim()) return;
+    try {
+      await kbEvalCorrect({ collection_id: selectedCol.id, question: row.question, answer: corrected.trim() });
+      setEvalFixedQ(prev => new Set(prev).add(row.question));
+      setEvalFixIdx(null);
+      void refresh();   // refresh chunk/doc counts so the new correction shows up
+    } catch (e: any) { setEvalErr(e.message); }
   };
 
   const handleDocChatSend = async () => {
@@ -2617,6 +2677,11 @@ function KnowledgeView({
   };
 
   useEffect(() => { if (panel === "analytics") void loadAnalytics(); }, [panel]);
+  // Load selectable voices (cloned + OpenAI + built-in) when the eval panel opens.
+  useEffect(() => {
+    if (panel !== "eval") return;
+    getVoices().then((v: any) => { if (v?.voices) setEvalVoices(v.voices); }).catch(() => {});
+  }, [panel]);
 
   // ── Config save ───────────────────────────────────────────────────────────
   const handleSaveConfig = async () => {
@@ -3288,14 +3353,18 @@ function KnowledgeView({
                   <label>Answer model</label>
                   <select value={evalAnswerModel} onChange={e => setEvalAnswerModel(e.target.value)}>
                     <option value="local">Local (Ollama)</option>
-                    <option value="openai">OpenAI</option>
+                    <optgroup label="OpenAI">
+                      {OPENAI_EVAL_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                    </optgroup>
                     <option value="gemini">Gemini</option>
                   </select>
                 </div>
                 <div className="eval-field">
                   <label>Verify model</label>
                   <select value={evalVerifyModel} onChange={e => setEvalVerifyModel(e.target.value)}>
-                    <option value="openai">OpenAI</option>
+                    <optgroup label="OpenAI">
+                      {OPENAI_EVAL_MODELS.map(m => <option key={m.value} value={m.value}>{m.label}</option>)}
+                    </optgroup>
                     <option value="gemini">Gemini</option>
                     <option value="local">Local (Ollama)</option>
                   </select>
@@ -3310,8 +3379,28 @@ function KnowledgeView({
                 </div>
                 <label className="eval-speak">
                   <input type="checkbox" checked={evalSpeak} onChange={e => setEvalSpeak(e.target.checked)} />
-                  <span>🔊 Speak answers (voice)</span>
+                  <span>🔊 Speak answers</span>
                 </label>
+                <div className="eval-field">
+                  <label>Voice</label>
+                  <select value={evalVoice} onChange={e => setEvalVoice(e.target.value)} disabled={!evalSpeak}>
+                    <option value="openai-alloy">OpenAI Alloy</option>
+                    {evalVoices.filter(v => v.id?.startsWith("openai-") && v.id !== "openai-alloy").length > 0 && (
+                      <optgroup label="OpenAI Cloud">
+                        {evalVoices.filter(v => v.id?.startsWith("openai-") && v.id !== "openai-alloy").map(v => <option key={v.id} value={v.id}>{v.name || v.id}</option>)}
+                      </optgroup>
+                    )}
+                    {evalVoices.filter(v => !v.id?.startsWith("openai-") && !["ne_NP-chitwan-medium","en_US-lessac-medium","ne_NP-google-medium","en_US-ryan-medium"].includes(v.id)).length > 0 && (
+                      <optgroup label="My cloned voices">
+                        {evalVoices.filter(v => !v.id?.startsWith("openai-") && !["ne_NP-chitwan-medium","en_US-lessac-medium","ne_NP-google-medium","en_US-ryan-medium"].includes(v.id)).map(v => <option key={v.id} value={v.id} disabled={!v.model_exists}>{v.name || v.id}{v.model_exists ? "" : " — untrained"}</option>)}
+                      </optgroup>
+                    )}
+                    <optgroup label="Built-in (Piper)">
+                      <option value="ne_NP-chitwan-medium">Chitwan Nepali</option>
+                      <option value="en_US-lessac-medium">Lessac English</option>
+                    </optgroup>
+                  </select>
+                </div>
               </div>
               <div className="eval-actions">
                 <button className="rag-toolbar-btn primary" onClick={handleGenerateQuestions} disabled={evalBusy !== null}>
@@ -3325,6 +3414,27 @@ function KnowledgeView({
                 <span className="eval-scope-note">Scope: {evalScopeLabel}</span>
               </div>
               {evalErr && <div className="eval-err"><CircleAlert size={14} /> {evalErr}</div>}
+
+              {/* Animated progress while evaluating */}
+              {evalProgress && (evalBusy === "run" || evalProgress.done < evalProgress.total) && (
+                <div className="eval-progress">
+                  <div className="eval-progress-head">
+                    <span className="eval-progress-spinner"><RefreshCw size={13} className="spin" /></span>
+                    <span>Evaluating question <b>{Math.min(evalProgress.done + (evalBusy === "run" ? 1 : 0), evalProgress.total)}</b> of <b>{evalProgress.total}</b></span>
+                    <span className="eval-progress-pct">{Math.round((evalProgress.done / Math.max(1, evalProgress.total)) * 100)}%</span>
+                  </div>
+                  <div className="eval-progress-track">
+                    <div className="eval-progress-fill" style={{ width: `${(evalProgress.done / Math.max(1, evalProgress.total)) * 100}%` }} />
+                  </div>
+                  <div className="eval-progress-dots">
+                    {Array.from({ length: evalProgress.total }).map((_, i) => {
+                      const r = evalResults?.[i];
+                      const cls = r ? `v-${r.verdict}` : (i === evalProgress.done && evalBusy === "run" ? "active" : "");
+                      return <span key={i} className={`eval-dot ${cls}`} />;
+                    })}
+                  </div>
+                </div>
+              )}
 
               {/* Generated questions preview */}
               {evalQuestions.length > 0 && !evalResults && (
@@ -3356,8 +3466,11 @@ function KnowledgeView({
               {evalResults && (
                 <div className="eval-section">
                   <div className="eval-section-title">Detailed results</div>
-                  {evalResults.map((r, i) => (
-                    <div key={i} className={`eval-row v-${r.verdict}`}>
+                  {evalResults.map((r, i) => {
+                    const needsFix = r.verdict === "incorrect" || r.verdict === "partial";
+                    const fixed = evalFixedQ.has(r.question);
+                    return (
+                    <div key={i} className={`eval-row v-${r.verdict} eval-row-reveal`}>
                       <div className="eval-row-head">
                         <span className={`eval-verdict v-${r.verdict}`}>{r.verdict}</span>
                         <span className="eval-q">{r.question}</span>
@@ -3368,10 +3481,32 @@ function KnowledgeView({
                         <div><b>Expected:</b> {r.reference}</div>
                         <div><b>Answer:</b> {r.answer}</div>
                         {r.reason && <div className="eval-reason"><b>Judge:</b> {r.reason}</div>}
-                        {r.audio_url && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(r.audio_url!) || "").play(); } catch {} }}><Volume2 size={12} /> Play</button>}
+                        <div className="eval-row-actions">
+                          {r.audio_url && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(r.audio_url!) || "").play(); } catch {} }}><Volume2 size={12} /> Play</button>}
+                          {fixed ? (
+                            <span className="eval-fixed"><CheckCircle2 size={13} /> Added to knowledge base</span>
+                          ) : needsFix && (
+                            <button className="rag-toolbar-btn eval-fix-btn" onClick={() => { setEvalFixIdx(evalFixIdx === i ? null : i); setEvalFixText(r.reference || ""); }}>
+                              <Wand2 size={12} /> Fix in KB
+                            </button>
+                          )}
+                        </div>
+                        {evalFixIdx === i && !fixed && (
+                          <div className="eval-fix-editor">
+                            <label>Correct answer to teach the knowledge base</label>
+                            <textarea value={evalFixText} onChange={e => setEvalFixText(e.target.value)} rows={2} placeholder="Type the correct, verified answer…" />
+                            <div className="eval-fix-actions">
+                              <button className="rag-toolbar-btn" onClick={() => setEvalFixIdx(null)}>Cancel</button>
+                              <button className="rag-toolbar-btn primary" onClick={() => void handleFixInKB(r, evalFixText)} disabled={!evalFixText.trim()}>
+                                <Save size={12} /> Save to knowledge base
+                              </button>
+                            </div>
+                            <p className="eval-fix-hint">This saves a verified Q&amp;A into the collection so the assistant answers correctly next time.</p>
+                          </div>
+                        )}
                       </div>
                     </div>
-                  ))}
+                  );})}
                 </div>
               )}
 
@@ -4503,6 +4638,20 @@ function fmtDuration(totalSeconds: number): string {
   const s = totalSeconds % 60;
   return `${m}:${String(s).padStart(2, "0")}`;
 }
+
+// Selectable OpenAI models for the evaluation answer/verify pickers. Encoded as
+// "openai:<model>" so the backend can route to a specific model. Mix of GPT-4 and
+// GPT-5 families; the account must have access to the chosen model.
+const OPENAI_EVAL_MODELS: { value: string; label: string }[] = [
+  { value: "openai:gpt-4o-mini", label: "OpenAI · gpt-4o-mini" },
+  { value: "openai:gpt-4o", label: "OpenAI · gpt-4o" },
+  { value: "openai:gpt-4.1-mini", label: "OpenAI · gpt-4.1-mini" },
+  { value: "openai:gpt-5", label: "OpenAI · gpt-5" },
+  { value: "openai:gpt-5-mini", label: "OpenAI · gpt-5-mini" },
+  { value: "openai:gpt-5.5", label: "OpenAI · gpt-5.5" },
+  { value: "openai:gpt-5.5-mini", label: "OpenAI · gpt-5.5-mini" },
+  { value: "openai:gpt-5.5-nano", label: "OpenAI · gpt-5.5-nano" },
+];
 
 // Unified, friendly progress stepper for the Create Voice flow.
 const WIZARD_STEPS = ["Details", "Consent", "Record", "Publish"];

@@ -1258,6 +1258,106 @@ def kb_eval_run(payload: dict):
             "total": len(rows), "accuracy": accuracy, "counts": counts, "results": rows}
 
 
+def _eval_judge_prompt(q: str, ref: str, ans: str) -> str:
+    return (
+        f"QUESTION: {q}\nREFERENCE ANSWER (from the source document): {ref}\n"
+        f"SYSTEM ANSWER: {ans[:1200]}\n\n"
+        'Grade whether the SYSTEM ANSWER is factually correct and consistent with the reference. '
+        '"correct" = right fact; "partial" = on-topic but incomplete; "incorrect" = wrong/refuses/empty. '
+        'Return ONLY JSON: {"verdict":"correct|partial|incorrect","reason":"<short>"}'
+    )
+
+
+@app.post("/kb/eval/run-stream")
+def kb_eval_run_stream(payload: dict):
+    """Same as /kb/eval/run but streams one result at a time (SSE) so the UI can
+    animate progress and reveal each graded answer as it lands."""
+    from fastapi import HTTPException
+    from fastapi.responses import StreamingResponse
+    import time, json as _json
+    cid = (payload.get("collection_id") or "").strip()
+    doc_id = (payload.get("document_id") or "").strip() or None
+    questions = (payload.get("questions") or [])[:30]
+    answer_model = payload.get("answer_model") or "local"
+    verify_model = payload.get("verify_model") or ("openai" if settings.openai_api_key else "local")
+    temperature = payload.get("temperature")
+    voice_id = (payload.get("voice_id") or "").strip() or None
+    if not cid or not questions:
+        raise HTTPException(status_code=400, detail="collection_id and questions are required.")
+
+    def gen():
+        verifier = conversation_service._instantiate_provider(verify_model)
+        counts = {"correct": 0, "partial": 0, "incorrect": 0, "error": 0}
+        valid = [it for it in questions if (it.get("q") or "").strip()]
+        total = len(valid)
+        yield "data: " + _json.dumps({"type": "start", "total": total,
+                                      "answer_model": answer_model, "verify_model": verify_model}) + "\n\n"
+        for idx, item in enumerate(valid, start=1):
+            q = (item.get("q") or "").strip()
+            ref = (item.get("a") or "").strip()
+            t0 = time.time()
+            try:
+                ans_resp = conversation_service.handle_text(
+                    q, voice_id=voice_id, knowledge_id=cid, document_id=doc_id,
+                    llm_provider_id=answer_model, temperature=temperature,
+                )
+                ans = ans_resp.response or ""
+                rag_used = bool(getattr(ans_resp, "rag_used", False))
+                audio_url = getattr(ans_resp, "audio_url", None)
+            except Exception as exc:
+                ans, rag_used, audio_url = f"(error: {exc})", False, None
+            latency = round(time.time() - t0, 1)
+            try:
+                jres = verifier.chat(_eval_judge_prompt(q, ref, ans),
+                                     system_prompt="You are a strict grader. Output only JSON.")
+                jd = _extract_json(jres.text)
+                verdict = jd.get("verdict", "incorrect")
+                reason = jd.get("reason", "")
+            except Exception as exc:
+                verdict, reason = "error", str(exc)[:80]
+            if verdict not in counts:
+                verdict = "incorrect"
+            counts[verdict] += 1
+            done = sum(counts.values())
+            accuracy = round(100 * (counts["correct"] + 0.5 * counts["partial"]) / done, 1) if done else 0
+            row = {"question": q, "reference": ref, "answer": ans, "rag_used": rag_used,
+                   "verdict": verdict, "reason": reason, "latency_s": latency, "audio_url": audio_url}
+            yield "data: " + _json.dumps({"type": "result", "index": idx, "total": total,
+                                          "result": row, "counts": counts, "accuracy": accuracy}) + "\n\n"
+        done = sum(counts.values()) or 1
+        accuracy = round(100 * (counts["correct"] + 0.5 * counts["partial"]) / done, 1)
+        yield "data: " + _json.dumps({"type": "done", "accuracy": accuracy, "counts": counts,
+                                      "answer_model": answer_model, "verify_model": verify_model}) + "\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.post("/kb/eval/correct")
+def kb_eval_correct(payload: dict):
+    """Fix an incorrect answer by injecting a curated Q&A 'golden' fact into the
+    knowledge base. This is the trusted RAG remediation pattern: the corrected
+    pair becomes a high-signal chunk the retriever surfaces for similar questions."""
+    from fastapi import HTTPException
+    import time
+    cid = (payload.get("collection_id") or "").strip()
+    question = (payload.get("question") or "").strip()
+    answer = (payload.get("answer") or "").strip()
+    if not cid or not question or not answer:
+        raise HTTPException(status_code=400, detail="collection_id, question, and answer are required.")
+    text = (
+        "Verified Q&A (curated correction).\n"
+        f"Question: {question}\n"
+        f"Answer: {answer}\n"
+    )
+    filename = f"correction-{int(time.time())}.txt"
+    try:
+        doc = kb_service.ingest_file(cid, text.encode("utf-8"), filename, "text/plain")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not save correction to the knowledge base: {exc}")
+    return {"ok": True, "document_id": getattr(doc, "id", None), "filename": filename}
+
+
 @app.get("/chat/history")
 def get_chat_history(limit: int = 50):
     from app.database import get_db_connection
