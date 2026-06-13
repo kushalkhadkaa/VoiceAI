@@ -2397,10 +2397,13 @@ function KnowledgeView({
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
 
   // ── Detail drawer ─────────────────────────────────────────────────────────
-  const [docChunks, setDocChunks] = useState<{ text: string; chunk_index: number }[]>([]);
+  const [docChunks, setDocChunks] = useState<{ text: string; chunk_index: number; page_number?: number | null }[]>([]);
   const [loadingChunks, setLoadingChunks] = useState(false);
   const [renamingDocId, setRenamingDocId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState("");
+  // When opened from an eval question/answer, highlight the matching source chunk.
+  const [chunkHighlight, setChunkHighlight] = useState<string | null>(null);
+  const [genElapsed, setGenElapsed] = useState(0);
 
   // ── Search panel ─────────────────────────────────────────────────────────
   const [searchQuery, setSearchQuery] = useState("");
@@ -2577,13 +2580,44 @@ function KnowledgeView({
   const handleStopCrawl = () => { crawlAbortRef.current?.abort(); };
 
   // ── Doc actions ───────────────────────────────────────────────────────────
-  const openDocDetail = async (docId: string) => {
+  const openDocDetail = async (docId: string, highlight?: string | null) => {
     setSelectedDocId(docId);
     setDocChunks([]); setLoadingChunks(true);
+    setChunkHighlight(highlight ?? null);
     if (!selectedCol) return;
-    try { setDocChunks((await getKBDocumentChunks(selectedCol.id, docId, 12)).chunks ?? []); }
+    // Fetch a generous number of chunks so we can locate the exact source section.
+    try { setDocChunks((await getKBDocumentChunks(selectedCol.id, docId, 500)).chunks ?? []); }
     catch (e: any) { setError(e.message); }
     finally { setLoadingChunks(false); }
+  };
+
+  // Word-overlap score so we can find which chunk a question/answer came from.
+  const _matchScore = (chunkText: string, target: string): number => {
+    const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9ऀ-ॿ\s]/g, " ");
+    const ct = norm(chunkText);
+    const words = Array.from(new Set(norm(target).split(/\s+/).filter(w => w.length > 2)));
+    if (!words.length) return 0;
+    let hits = 0;
+    for (const w of words) if (ct.includes(w)) hits++;
+    return hits / words.length;
+  };
+  const bestChunkIdx = useMemo(() => {
+    if (!chunkHighlight || !docChunks.length) return -1;
+    let best = -1, bestScore = 0.34;  // require a minimum overlap to avoid false matches
+    docChunks.forEach((c, i) => {
+      const s = _matchScore(c.text || "", chunkHighlight);
+      if (s > bestScore) { bestScore = s; best = i; }
+    });
+    return best;
+  }, [chunkHighlight, docChunks]);
+
+  // Open the source document for an eval question/answer and highlight the section.
+  const openSourceForQA = (sourceDoc: string | null | undefined, matchText: string) => {
+    if (!sourceDoc) return;
+    const doc = documents.find(d => d.filename === sourceDoc) || documents.find(d => sourceDoc.includes(d.filename) || d.filename.includes(sourceDoc));
+    if (!doc) { setError(`Could not find the source document "${sourceDoc}" in this collection.`); return; }
+    setPanel(null);                       // leave the eval overlay → show the document
+    void openDocDetail(doc.id, matchText);
   };
 
   const handleDeleteDoc = async (docId: string, e: React.MouseEvent) => {
@@ -2771,6 +2805,20 @@ function KnowledgeView({
     if (panel !== "eval") return;
     getVoices().then((v: any) => { if (v?.voices) setEvalVoices(v.voices); }).catch(() => {});
   }, [panel]);
+  // Live elapsed timer while questions are being generated (drives the animation).
+  useEffect(() => {
+    if (evalBusy !== "gen") { setGenElapsed(0); return; }
+    const start = Date.now();
+    const id = window.setInterval(() => setGenElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    return () => clearInterval(id);
+  }, [evalBusy]);
+  // Scroll the highlighted source chunk into view when a doc is opened from eval.
+  const highlightRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (bestChunkIdx >= 0 && highlightRef.current) {
+      highlightRef.current.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  }, [bestChunkIdx, docChunks]);
 
   // ── Config save ───────────────────────────────────────────────────────────
   const handleSaveConfig = async () => {
@@ -3321,6 +3369,9 @@ function KnowledgeView({
               <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 12, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.5 }}>
                 Content Chunks ({loadingChunks ? "loading…" : `${docChunks.length} of ${selectedDoc.chunk_count}`})
               </div>
+              {chunkHighlight && bestChunkIdx >= 0 && !loadingChunks && (
+                <div className="chunk-locate-note"><Search size={12} /> Jumped to the section that answers this — highlighted below.</div>
+              )}
               {loadingChunks ? (
                 <div style={{ textAlign: "center", padding: 24, color: "var(--muted)" }}>
                   <RefreshCw size={18} className="spin" />
@@ -3328,12 +3379,18 @@ function KnowledgeView({
               ) : docChunks.length === 0 ? (
                 <div style={{ color: "var(--muted)", fontSize: 13, textAlign: "center", padding: 24 }}>No chunks loaded.</div>
               ) : (
-                docChunks.map(c => (
-                  <div key={c.chunk_index} className="chunk-card">
-                    <div className="chunk-card-label">CHUNK #{c.chunk_index}</div>
+                docChunks.map((c, ci) => {
+                  const hot = ci === bestChunkIdx;
+                  return (
+                  <div key={c.chunk_index} ref={hot ? highlightRef : undefined} className={`chunk-card${hot ? " chunk-highlight" : ""}`}>
+                    <div className="chunk-card-label">
+                      CHUNK #{c.chunk_index}{c.page_number != null ? ` · page ${c.page_number}` : ""}
+                      {hot && <span className="chunk-hot-badge">★ source of the answer</span>}
+                    </div>
                     <p>{c.text}</p>
                   </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
@@ -3561,6 +3618,31 @@ function KnowledgeView({
               </div>
               {evalErr && <div className="eval-err"><CircleAlert size={14} /> {evalErr}</div>}
 
+              {/* Animated "generating questions" experience */}
+              {evalBusy === "gen" && (() => {
+                const phases = [
+                  { icon: "📚", text: "Reading documents across the collection…" },
+                  { icon: "✍️", text: "Drafting diverse questions from each document…" },
+                  { icon: "🔎", text: "Pulling the exact answers from the source text…" },
+                  { icon: "🧭", text: "Tagging each question's document and topic…" },
+                  { icon: "✨", text: "Polishing the final set…" },
+                ];
+                const phase = phases[Math.min(phases.length - 1, Math.floor(genElapsed / 4))];
+                return (
+                  <div className="gen-anim">
+                    <div className="gen-anim-orb"><Sparkles size={22} /></div>
+                    <div className="gen-anim-body">
+                      <div className="gen-anim-title">Generating {evalN} question{evalN === 1 ? "" : "s"} <span className="gen-anim-time">{genElapsed}s</span></div>
+                      <div className="gen-anim-phase">{phase.icon} {phase.text}</div>
+                      <div className="gen-anim-track"><div className="gen-anim-fill" /></div>
+                      <div className="gen-anim-steps">
+                        {phases.map((p, i) => <span key={i} className={`gen-step ${genElapsed / 4 >= i ? "done" : ""} ${Math.floor(genElapsed / 4) === i ? "active" : ""}`}>{p.icon}</span>)}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* Animated progress while evaluating */}
               {evalProgress && (evalBusy === "run" || evalProgress.done < evalProgress.total) && (
                 <div className="eval-progress">
@@ -3593,7 +3675,11 @@ function KnowledgeView({
                     </div>
                   )}
                   <ol className="eval-qlist">
-                    {evalQuestions.map((q, i) => <li key={i}><b>{q.q}</b><span>{q.a}</span>{q.source_doc && <em>{q.source_doc}{q.dimension ? ` · ${q.dimension}` : ""}</em>}</li>)}
+                    {evalQuestions.map((q, i) => <li key={i}><b>{q.q}</b><span>{q.a}</span>{q.source_doc && (
+                      <button type="button" className="eval-source-link" title={`Open ${q.source_doc} and highlight the exact section`} onClick={() => openSourceForQA(q.source_doc, q.a || q.q)}>
+                        <FileText size={11} /> {q.source_doc}{q.dimension ? ` · ${q.dimension}` : ""} <ChevronRight size={11} />
+                      </button>
+                    )}</li>)}
                   </ol>
                 </div>
               )}
@@ -3666,7 +3752,15 @@ function KnowledgeView({
                         <span className="eval-lat">{r.latency_s}s</span>
                       </div>
                       <div className="eval-row-body">
-                        {(r.source_doc || r.dimension) && <div className="eval-source"><b>Source:</b> {r.source_doc || "unknown"}{r.dimension ? ` · ${r.dimension}` : ""}</div>}
+                        {(r.source_doc || r.dimension) && (
+                          <div className="eval-source"><b>Source:</b>{" "}
+                            {r.source_doc ? (
+                              <button type="button" className="eval-source-link" title={`Open ${r.source_doc} and highlight the section that answers this`} onClick={() => openSourceForQA(r.source_doc, r.reference || r.answer || r.question || "")}>
+                                <FileText size={11} /> {r.source_doc}{r.dimension ? ` · ${r.dimension}` : ""} <ChevronRight size={11} />
+                              </button>
+                            ) : <span>unknown{r.dimension ? ` · ${r.dimension}` : ""}</span>}
+                          </div>
+                        )}
                         <div><b>Expected:</b> {r.reference}</div>
                         <div><b>Answer:</b> {r.answer}</div>
                         {r.reason && <div className="eval-reason"><b>Judge:</b> {r.reason}</div>}
