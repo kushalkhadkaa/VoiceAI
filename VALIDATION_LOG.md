@@ -1,6 +1,13 @@
 # Validation Log
 
-Updated: 2026-06-07
+Updated: 2026-06-13 21:27:41 +0545
+
+- PASS: `git push origin feat/voice-studio-ux` returned `Everything up-to-date` before this handoff-doc update.
+- PASS: Backend health check at `http://127.0.0.1:8001/health` returned `{"ok":true,"app":"SwarLocal","version":"0.1.0"}`.
+- PASS: Frontend dev server started at `http://127.0.0.1:5173/` with Vite.
+- PASS: System metrics endpoint returned a healthy recommendation with roughly 8 GB RAM available and 27 GB disk free at the time checked.
+- PASS: Provider status showed OpenAI available, local models available, and Gemini unavailable because the Gemini key is empty.
+- NOTE: No full `make test` / `make lint` rerun was performed for this documentation-only handoff update.
 
 - PASS: `make test` ran 55 backend tests successfully after real Chatterbox clone routing replaced fake Piper copy-cloning.
 - PASS: `make lint` compiled backend/tests/scripts and ran frontend typecheck.

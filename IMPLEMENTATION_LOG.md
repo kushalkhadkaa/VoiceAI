@@ -1,5 +1,13 @@
 # Implementation Log
 
+## 2026-06-13
+
+- Reviewed the active running checkout at `/Users/kushalkhadka/VoiceAI` and confirmed it differs from the older `/Users/kushalkhadka/Documents/VoiceAI` checkout.
+- Confirmed branch `feat/voice-studio-ux` is pushed through `c877798322a91fa6b19f6d59d95888cad5660b8f`.
+- Documented recent branch work: RAG crawler/eval, non-blocking TTS, Voice Studio UX, Chatterbox serialization, heavy-job single-flight guard, OpenAI retry/provider routing, and system pulse/auto-recovery.
+- Started the frontend dev server on `http://127.0.0.1:5173/` against the observed backend on `http://127.0.0.1:8001`.
+- Updated README and handoff documents so future coding tools can start from the latest branch state, ports, provider status, untracked files, and pending work.
+
 ## 2026-06-07
 
 - Replaced the fake Piper “clone” path that copied built-in `.onnx` files with a real Chatterbox zero-shot clone path that builds `chatterbox_reference.wav` from consented recordings and routes synthesis through Chatterbox.
