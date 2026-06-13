@@ -2118,6 +2118,27 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 .preflight-row.bad .preflight-icon { color: var(--rose); }
 .preflight-row.bad .preflight-detail { color: var(--rose); }
 .preflight-row.idle .preflight-icon { color: var(--muted); }
+
+/* Shared studio status banner (busy / ok / error) */
+.studio-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 13px 16px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line);
+  margin-bottom: 4px;
+}
+.studio-status svg { flex-shrink: 0; }
+.studio-status-text { font-size: 13px; font-weight: 600; flex: 1; line-height: 1.45; }
+.studio-status-close { background: none; border: none; cursor: pointer; color: var(--muted); font-size: 14px; flex-shrink: 0; padding: 2px 4px; }
+.studio-status-close:hover { color: var(--ink); }
+.studio-status.busy { background: var(--teal-soft); border-color: rgba(0,166,81,0.4); }
+.studio-status.busy svg, .studio-status.busy .studio-status-text { color: var(--teal); }
+.studio-status.ok { background: var(--green-soft); border-color: rgba(72,187,120,0.4); }
+.studio-status.ok svg, .studio-status.ok .studio-status-text { color: var(--green); }
+.studio-status.err { background: var(--rose-soft); border-color: rgba(239,102,114,0.4); }
+.studio-status.err svg, .studio-status.err .studio-status-text { color: var(--rose); }
 .quality { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 999px; white-space: nowrap; border: 1px solid transparent; }
 .quality.good, .quality.pass { background: var(--green-soft); color: var(--green); border-color: rgba(0,166,81,0.25); }
 .quality.review { background: var(--amber-soft); color: var(--amber); border-color: rgba(201,162,39,0.25); }

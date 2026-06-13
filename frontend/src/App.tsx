@@ -312,6 +312,7 @@ function App() {
   const [voices, setVoices] = useState<VoicesResponse | null>(null);
   const [manualText, setManualText] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [ttsTestingId, setTtsTestingId] = useState<string | null>(null);
   const [lastAudioUrl, setLastAudioUrl] = useState<string | null>(null);
   const [datasetRecordings, setDatasetRecordings] = useState<DatasetRecording[]>([]);
   const [datasetActivePrompt, setDatasetActivePrompt] = useState<string | null>(null);
@@ -1090,10 +1091,11 @@ function App() {
 
   async function runTtsTest(language: "ne" | "en", voiceId?: string) {
     setError(null);
+    setTtsTestingId(voiceId ?? `__${language}`);
     try {
       if (voiceId) {
-        const text = language === "ne" 
-          ? "नमस्ते, यो नयाँ आवाजको पूर्वअवलोकन हो।" 
+        const text = language === "ne"
+          ? "नमस्ते, यो नयाँ आवाजको पूर्वअवलोकन हो।"
           : "Hello, this is a preview of the selected voice.";
         const res = await previewTts(text, voiceId, language);
         if (res.ok && res.audio_url) {
@@ -1104,6 +1106,7 @@ function App() {
           }
         } else {
           setError(res.detail ?? "Voice preview failed.");
+          throw new Error(res.detail ?? "Voice preview failed.");
         }
       } else {
         const text = language === "ne" ? "नमस्ते, Piper आवाज परीक्षण सफल भयो।" : "Hello, Piper voice test was successful.";
@@ -1116,6 +1119,9 @@ function App() {
       }
     } catch (ttsError) {
       setError(ttsError instanceof Error ? ttsError.message : "TTS test failed.");
+      throw ttsError; // let callers (e.g. Voice Studio) show their own busy/error UI
+    } finally {
+      setTtsTestingId(null);
     }
   }
 
@@ -1269,6 +1275,7 @@ function App() {
             auditLogs={auditLogs}
             onRefresh={refreshStatus}
             onTtsTest={runTtsTest}
+            ttsTestingId={ttsTestingId}
           />
         );
       case "knowledge":
@@ -4105,7 +4112,7 @@ function SetupView({
   voiceSocketStatus: VoiceSocketStatus | null;
   onRefresh: () => void;
   onTestVoiceSocket: () => void;
-  onTtsTest: (language: "ne" | "en", voiceId?: string) => void;
+  onTtsTest: (language: "ne" | "en", voiceId?: string) => Promise<void> | void;
 }) {
   const blockers = providerStatus.filter((provider) => !provider.ok && provider.critical !== false);
   const others = providerStatus.filter((provider) => provider.ok || provider.critical === false);
@@ -4158,11 +4165,11 @@ function SetupView({
         ))}
       </div>
       <div className="action-band">
-        <button className="icon-text" onClick={() => onTtsTest("ne")} type="button">
+        <button className="icon-text" onClick={() => { Promise.resolve(onTtsTest("ne")).catch(() => {}); }} type="button">
           <Volume2 size={18} />
           <span>Nepali TTS</span>
         </button>
-        <button className="icon-text" onClick={() => onTtsTest("en")} type="button">
+        <button className="icon-text" onClick={() => { Promise.resolve(onTtsTest("en")).catch(() => {}); }} type="button">
           <Volume2 size={18} />
           <span>English TTS</span>
         </button>
@@ -4279,6 +4286,22 @@ const STUDIO_HOWTO = [
   { n: 4, icon: "🚀", title: "Publish", desc: "Activate the voice so the assistant can speak with it." },
 ];
 
+// Shared status banner for the Voice Studio (busy / ok / error feedback).
+function StudioStatusBanner({ msg, onClose }: { msg: { kind: "ok" | "err" | "busy"; text: string } | null; onClose: () => void }) {
+  if (!msg) return null;
+  return (
+    <div className={`studio-status ${msg.kind}`}>
+      {msg.kind === "busy" ? <RefreshCw size={18} className="spin" />
+        : msg.kind === "ok" ? <CheckCircle2 size={18} />
+        : <CircleAlert size={18} />}
+      <span className="studio-status-text">{msg.text}</span>
+      {msg.kind !== "busy" && (
+        <button className="studio-status-close" onClick={onClose} type="button" aria-label="Dismiss">✕</button>
+      )}
+    </div>
+  );
+}
+
 // Pre-flight readiness — surfaces mic + engine problems BEFORE the user records,
 // so nobody records a dozen takes only to hit an error at build time.
 function RecordingPreflight({
@@ -4349,13 +4372,15 @@ function VoiceStudioView({
   galleryVoices,
   auditLogs,
   onRefresh,
-  onTtsTest
+  onTtsTest,
+  ttsTestingId
 }: {
   voices: VoicesResponse | null;
   galleryVoices: any[];
   auditLogs: any[];
   onRefresh: () => void;
-  onTtsTest: (language: "ne" | "en", voiceId?: string) => void;
+  onTtsTest: (language: "ne" | "en", voiceId?: string) => Promise<void> | void;
+  ttsTestingId: string | null;
 }) {
   const [selectedVoice, setSelectedVoice] = useState<any | null>(null);
   const [cleaningAll, setCleaningAll] = useState(false);
@@ -4487,6 +4512,24 @@ function VoiceStudioView({
   useEffect(() => () => stopRecordingInternals(), []);
 
   const [creatingVoice, setCreatingVoice] = useState(false);
+
+  // Wraps onTtsTest with clear busy/done feedback so a slow first-run model
+  // download never looks frozen (and re-clicks can't pile up more downloads).
+  const handleTestVoice = async (language: "ne" | "en", voiceId?: string, isLocalClone = false) => {
+    if (ttsTestingId) return; // a test is already running — ignore extra clicks
+    setStudioMsg({
+      kind: "busy",
+      text: isLocalClone
+        ? "Generating a preview with this voice… the first time, the local voice model (~1–2 GB) downloads, so this can take a few minutes. It only happens once — later previews are quick."
+        : "Generating a quick voice sample…",
+    });
+    try {
+      await onTtsTest(language, voiceId);
+      setStudioMsg({ kind: "ok", text: "Preview ready — playing now. If you can't hear it, check your volume." });
+    } catch (err: any) {
+      setStudioMsg({ kind: "err", text: err?.message || "Couldn't generate a preview. Please try again in a moment." });
+    }
+  };
 
   const handleCreateVoice = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -4817,6 +4860,9 @@ function VoiceStudioView({
             </div>
           </div>
 
+          {/* Test/preview feedback — never leave a click looking frozen */}
+          <StudioStatusBanner msg={studioMsg} onClose={() => setStudioMsg(null)} />
+
           {/* Friendly intro + how it works */}
           <div className="studio-hero">
             <div className="studio-hero-main">
@@ -4900,10 +4946,11 @@ function VoiceStudioView({
                 <span className="pill good">Commercial OK</span>
               </div>
               <div className="voice-card-actions">
-                <button className="voice-action-secondary" onClick={() => onTtsTest("ne")} type="button"
+                <button className="voice-action-secondary" onClick={() => handleTestVoice("ne")} type="button"
+                  disabled={!!ttsTestingId}
                   title="Hear a short sample spoken in this Nepali voice.">
-                  <Volume2 size={16} />
-                  <span>Hear a sample</span>
+                  {ttsTestingId === "__ne" ? <RefreshCw size={16} className="spin" /> : <Volume2 size={16} />}
+                  <span>{ttsTestingId === "__ne" ? "Playing…" : "Hear a sample"}</span>
                 </button>
               </div>
             </article>
@@ -4925,10 +4972,11 @@ function VoiceStudioView({
                 <span className="pill good">Commercial OK</span>
               </div>
               <div className="voice-card-actions">
-                <button className="voice-action-secondary" onClick={() => onTtsTest("en")} type="button"
+                <button className="voice-action-secondary" onClick={() => handleTestVoice("en")} type="button"
+                  disabled={!!ttsTestingId}
                   title="Hear a short sample spoken in this English voice.">
-                  <Volume2 size={16} />
-                  <span>Hear a sample</span>
+                  {ttsTestingId === "__en" ? <RefreshCw size={16} className="spin" /> : <Volume2 size={16} />}
+                  <span>{ttsTestingId === "__en" ? "Playing…" : "Hear a sample"}</span>
                 </button>
               </div>
             </article>
@@ -4954,9 +5002,11 @@ function VoiceStudioView({
                   <span className="pill">Quality {Math.round(cv.quality_score ?? 0)}</span>
                 </div>
                 <div className="voice-card-actions">
-                  <button className="voice-action-secondary" onClick={() => onTtsTest(cv.language === "en" ? "en" : "ne", cv.id)} type="button">
-                    <Volume2 size={16} />
-                    <span>Test</span>
+                  <button className="voice-action-secondary"
+                    onClick={() => handleTestVoice(cv.language === "en" ? "en" : "ne", cv.id, (cv.engine || "").includes("chatterbox") || (cv.engine || "").includes("f5") || (cv.engine || "").includes("openvoice") || (cv.engine || "").includes("voxcpm"))}
+                    disabled={!!ttsTestingId} type="button">
+                    {ttsTestingId === cv.id ? <RefreshCw size={16} className="spin" /> : <Volume2 size={16} />}
+                    <span>{ttsTestingId === cv.id ? "Generating…" : "Test"}</span>
                   </button>
                   {cv.publish_status !== 'published' ? (
                     <button className="voice-action-primary" onClick={() => { setSelectedVoice(cv); setWizardStep(cv.consent_status === "completed" ? "recordings" : "consent"); }} type="button">
@@ -5018,8 +5068,9 @@ function VoiceStudioView({
               <div key={v.id} className="voice-tts-card">
                 <strong>{v.label}</strong>
                 <span>{v.desc}</span>
-                <button className="voice-action-secondary" onClick={() => onTtsTest("en", v.id)} type="button">
-                  <Volume2 size={14} /><span>Preview</span>
+                <button className="voice-action-secondary" onClick={() => handleTestVoice("en", v.id)} disabled={!!ttsTestingId} type="button">
+                  {ttsTestingId === v.id ? <RefreshCw size={14} className="spin" /> : <Volume2 size={14} />}
+                  <span>{ttsTestingId === v.id ? "Playing…" : "Preview"}</span>
                 </button>
               </div>
             ))}
@@ -5194,23 +5245,7 @@ function VoiceStudioView({
           />
 
           {/* Live status banner — always visible feedback, no silent failures */}
-          {studioMsg && (
-            <div style={{
-              display: "flex", alignItems: "center", gap: 10, padding: "14px 18px", borderRadius: 12, marginBottom: 16,
-              background: studioMsg.kind === "ok" ? "rgba(72,187,120,0.12)" : studioMsg.kind === "err" ? "rgba(245,101,101,0.12)" : "rgba(0,166,81,0.12)",
-              border: `1px solid ${studioMsg.kind === "ok" ? "rgba(72,187,120,0.4)" : studioMsg.kind === "err" ? "rgba(245,101,101,0.4)" : "rgba(0,166,81,0.4)"}`,
-            }}>
-              {studioMsg.kind === "busy" ? <RefreshCw size={18} className="spin" style={{ color: "var(--teal)", flexShrink: 0 }} />
-                : studioMsg.kind === "ok" ? <CheckCircle2 size={18} style={{ color: "var(--green)", flexShrink: 0 }} />
-                : <CircleAlert size={18} style={{ color: "var(--rose)", flexShrink: 0 }} />}
-              <span style={{ fontSize: 13, fontWeight: 600, flex: 1, color: studioMsg.kind === "ok" ? "var(--green)" : studioMsg.kind === "err" ? "var(--rose)" : "var(--ink)" }}>
-                {studioMsg.text}
-              </span>
-              {studioMsg.kind !== "busy" && (
-                <button style={{ background: "none", border: "none", cursor: "pointer", color: "var(--muted)", fontSize: 14 }} onClick={() => setStudioMsg(null)}>✕</button>
-              )}
-            </div>
-          )}
+          <StudioStatusBanner msg={studioMsg} onClose={() => setStudioMsg(null)} />
 
           {/* ── 4-STEP PIPELINE ── */}
           {(() => {
@@ -6356,7 +6391,7 @@ function SettingsView({
   voices: VoicesResponse | null;
   onSave: (settings: BackendSettings) => void;
   onDelete: () => void;
-  onTtsTest: (language: "ne" | "en", voiceId?: string) => void;
+  onTtsTest: (language: "ne" | "en", voiceId?: string) => Promise<void> | void;
 }) {
   const [draft, setDraft] = useState(settings);
   useEffect(() => setDraft(settings), [settings]);
@@ -6734,8 +6769,8 @@ function SettingsView({
             <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 20 }}>
               {voices ? (
                 <>
-                  <VoiceCard label="Nepali voice" voice={voices.selected.nepali} onTest={() => onTtsTest("ne", voices.selected.nepali.id)} />
-                  <VoiceCard label="English voice" voice={voices.selected.english} onTest={() => onTtsTest("en", voices.selected.english.id)} />
+                  <VoiceCard label="Nepali voice" voice={voices.selected.nepali} onTest={() => { Promise.resolve(onTtsTest("ne", voices.selected.nepali.id)).catch(() => {}); }} />
+                  <VoiceCard label="English voice" voice={voices.selected.english} onTest={() => { Promise.resolve(onTtsTest("en", voices.selected.english.id)).catch(() => {}); }} />
                 </>
               ) : (
                 <p style={{ color: "var(--muted)", fontSize: 13 }}>Voice registry unavailable</p>

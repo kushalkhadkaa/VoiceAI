@@ -751,7 +751,7 @@ class ChatterboxTTSProvider:
             if language_id is not None:
                 kwargs["language_id"] = language_id
             wav = model.generate(part.text.strip(), **kwargs)
-            ta.save(str(output_path), wav, model.sr)
+            self._save_wav(output_path, wav, model.sr)
         except ProviderUnavailableError:
             raise
         except Exception as exc:
@@ -770,11 +770,33 @@ class ChatterboxTTSProvider:
                     if language_id is not None:
                         kwargs["language_id"] = language_id
                     wav = model.generate(part.text.strip(), **kwargs)
-                    ta.save(str(output_path), wav, model.sr)
+                    self._save_wav(output_path, wav, model.sr)
                     return
                 except Exception:
                     pass
             raise ProviderUnavailableError(f"Chatterbox failed to synthesize cloned voice audio: {exc}") from exc
+
+    @staticmethod
+    def _save_wav(output_path: Any, wav: Any, sr: int) -> None:
+        """Write the generated waveform to disk.
+
+        torchaudio 2.11 routes ``save`` through TorchCodec, which needs an
+        ffmpeg build TorchCodec supports (<= 7). On systems with a newer ffmpeg
+        that load fails, so we write via soundfile (libsndfile), which has no
+        such dependency, and only fall back to torchaudio if soundfile is
+        unavailable.
+        """
+        try:
+            import numpy as np
+            import soundfile as sf
+            data = wav.detach().cpu().numpy() if hasattr(wav, "detach") else np.asarray(wav)
+            if data.ndim == 2 and data.shape[0] < data.shape[1]:
+                data = data.T  # (channels, frames) -> (frames, channels)
+            sf.write(str(output_path), data, int(sr))
+            return
+        except Exception:
+            import torchaudio as ta
+            ta.save(str(output_path), wav, int(sr))
 
     def _model_for_language(self, language: LanguageCode, device: str) -> tuple[Any, str | None]:
         if language == "en":
