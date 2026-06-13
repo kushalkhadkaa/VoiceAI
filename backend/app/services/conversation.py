@@ -78,6 +78,8 @@ class ConversationService:
         llm_provider_id: str | None = None,
         session_id: str | None = None,
         stt_provider_id: str | None = None,
+        document_id: str | None = None,
+        temperature: float | None = None,
     ) -> ConversationResponse:
         started = time.perf_counter()
         return self._complete_turn(
@@ -90,6 +92,8 @@ class ConversationService:
             llm_provider_id=llm_provider_id,
             session_id=session_id,
             stt_provider_id=stt_provider_id,
+            document_id=document_id,
+            temperature=temperature,
         )
 
 
@@ -162,7 +166,7 @@ class ConversationService:
             "Do not use any other language or script."
         )
 
-    def _retrieve_kb_context(self, query: str, knowledge_id: str | None = None) -> tuple[str, str | None, str | None]:
+    def _retrieve_kb_context(self, query: str, knowledge_id: str | None = None, document_id: str | None = None) -> tuple[str, str | None, str | None]:
         # RAG-first: the banking assistant grounds EVERY turn (text + voice) in the
         # local Nabil Bank knowledge base. Retrieval is NOT gated on rag_enabled.
         # If a specific knowledge_id is selected, search only that collection;
@@ -194,7 +198,7 @@ class ConversationService:
                 return "", None, None
 
         try:
-            context = self.kb_service.build_context(query, collection_ids)
+            context = self.kb_service.build_context(query, collection_ids, doc_id=document_id)
             return context, "local_kb" if context else None, rag_collection_id if context else None
         except Exception as exc:
             logger.warning("Local KB retrieval failed: %s", exc)
@@ -238,6 +242,8 @@ class ConversationService:
         llm_provider_id: str | None = None,
         session_id: str | None = None,
         stt_provider_id: str | None = None,
+        document_id: str | None = None,
+        temperature: float | None = None,
     ) -> ConversationResponse:
         input_language = self.language_router.detect(text, whisper_language, whisper_confidence)
         
@@ -259,7 +265,7 @@ class ConversationService:
                 citations = search_results
                 
         modality = "voice" if transcript_ms is not None else "text"
-        knowledge_context, rag_path, rag_collection_id = self._retrieve_kb_context(text, knowledge_id)
+        knowledge_context, rag_path, rag_collection_id = self._retrieve_kb_context(text, knowledge_id, document_id)
         rag_used = bool(knowledge_context)
         llm_input = self._build_llm_input(text, input_language.language, knowledge_context, citations if internet_used else [])
         system_prompt = self._effective_system_prompt(input_language.language, modality)
@@ -292,28 +298,41 @@ class ConversationService:
             provider_instance = self.llm_provider
         else:
             provider_instance = self._instantiate_provider(actual_provider)
-        
+
+        # Per-turn temperature override (used by the RAG evaluation / doc-chat feature).
+        # Save the original so a one-off override never leaks onto the shared provider.
+        _orig_temperature = getattr(provider_instance, "temperature", None)
+        if temperature is not None and hasattr(provider_instance, "temperature"):
+            try:
+                provider_instance.temperature = float(temperature)
+            except (TypeError, ValueError):
+                pass
+
         rag_fallback_used = False
         fallback_used = False
         fallback_reason = None
         llm_result = None
 
         try:
-            llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
-        except Exception as e:
-            if actual_provider in ("openai", "gemini") and self.settings.cloud_fallback_to_local:
-                fallback_used = True
-                fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local Ollama."
-                actual_provider = "local"
-                provider_instance = self.llm_provider
+            try:
                 llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
-            elif actual_provider == "local" and knowledge_id and knowledge_id != "none" and self.settings.rag_fallback_to_ollama:
-                rag_fallback_used = True
-                fallback_reason = f"Local RAG prompt failed: {e}. Retrying direct local chat."
-                direct_input = self._build_llm_input(text, input_language.language, "", citations if internet_used else [])
-                llm_result = provider_instance.chat(direct_input, system_prompt=system_prompt)
-            else:
-                raise
+            except Exception as e:
+                if actual_provider in ("openai", "gemini") and self.settings.cloud_fallback_to_local:
+                    fallback_used = True
+                    fallback_reason = f"Cloud provider {actual_provider} failed: {e}. Falling back to local Ollama."
+                    actual_provider = "local"
+                    provider_instance = self.llm_provider
+                    llm_result = provider_instance.chat(llm_input, system_prompt=system_prompt)
+                elif actual_provider == "local" and knowledge_id and knowledge_id != "none" and self.settings.rag_fallback_to_ollama:
+                    rag_fallback_used = True
+                    fallback_reason = f"Local RAG prompt failed: {e}. Retrying direct local chat."
+                    direct_input = self._build_llm_input(text, input_language.language, "", citations if internet_used else [])
+                    llm_result = provider_instance.chat(direct_input, system_prompt=system_prompt)
+                else:
+                    raise
+        finally:
+            if temperature is not None and _orig_temperature is not None and hasattr(self.llm_provider, "temperature"):
+                self.llm_provider.temperature = _orig_temperature
 
         response_language = self.language_router.detect(llm_result.text)
 

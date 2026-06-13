@@ -106,6 +106,9 @@ import {
   clearKBAnalytics,
   getKBCollectionStats,
   exportKBCollection,
+  kbEvalGenerate,
+  kbEvalRun,
+  chatWithDocument,
   voiceTurnRest,
   setActiveAIProvider,
   getOpenAIModels,
@@ -121,7 +124,7 @@ import {
   type CrawlEvent,
   type CrawlSiteOptions
 } from "./api";
-import type { AdvancedQueryOptions } from "./api";
+import type { AdvancedQueryOptions, EvalQA, EvalRow } from "./api";
 import { blobToBase64, downloadBlob, scoreRecording } from "./audio";
 import type {
   AssistantStatus,
@@ -2246,7 +2249,24 @@ function KnowledgeView({
   const [serviceDown, setServiceDown] = useState(false);
 
   // ── Panel mode: null = docs grid ─────────────────────────────────────────
-  const [panel, setPanel] = useState<null | "search" | "analytics" | "config" | "newcol">(null);
+  const [panel, setPanel] = useState<null | "search" | "analytics" | "config" | "newcol" | "eval">(null);
+
+  // ── Evaluation & document chat ──────────────────────────────────────────
+  const [evalDocId, setEvalDocId] = useState<string>("");          // "" = whole collection
+  const [evalAnswerModel, setEvalAnswerModel] = useState("local");
+  const [evalVerifyModel, setEvalVerifyModel] = useState("openai");
+  const [evalTemp, setEvalTemp] = useState(0.2);
+  const [evalN, setEvalN] = useState(5);
+  const [evalSpeak, setEvalSpeak] = useState(false);
+  const [evalQuestions, setEvalQuestions] = useState<EvalQA[]>([]);
+  const [evalResults, setEvalResults] = useState<EvalRow[] | null>(null);
+  const [evalSummary, setEvalSummary] = useState<{ accuracy: number; counts: Record<string, number>; answer_model: string; verify_model: string } | null>(null);
+  const [evalBusy, setEvalBusy] = useState<null | "gen" | "run">(null);
+  const [evalErr, setEvalErr] = useState<string | null>(null);
+  // Document chat
+  const [docChatInput, setDocChatInput] = useState("");
+  const [docChatLog, setDocChatLog] = useState<{ role: "user" | "ai"; text: string; rag?: boolean; audio?: string | null }[]>([]);
+  const [docChatBusy, setDocChatBusy] = useState(false);
 
   // ── New collection form ───────────────────────────────────────────────────
   const [newColName, setNewColName] = useState("");
@@ -2495,6 +2515,58 @@ function KnowledgeView({
     finally { setSearching(false); }
   };
 
+  // ── Evaluation & document chat ──────────────────────────────────────────
+  const evalScopeLabel = evalDocId
+    ? (documents.find(d => d.id === evalDocId)?.filename ?? "selected document")
+    : `whole collection (${documents.length} docs)`;
+
+  const handleGenerateQuestions = async () => {
+    if (!selectedCol) return;
+    setEvalBusy("gen"); setEvalErr(null); setEvalResults(null); setEvalSummary(null);
+    try {
+      const res = await kbEvalGenerate({
+        collection_id: selectedCol.id, document_id: evalDocId || null, n: evalN, gen_model: "openai",
+      });
+      setEvalQuestions(res.questions);
+      if (!res.questions.length) setEvalErr("No questions could be generated from this scope.");
+    } catch (e: any) { setEvalErr(e.message); }
+    finally { setEvalBusy(null); }
+  };
+
+  const handleRunEval = async () => {
+    if (!selectedCol || !evalQuestions.length) return;
+    setEvalBusy("run"); setEvalErr(null);
+    try {
+      const res = await kbEvalRun({
+        collection_id: selectedCol.id, document_id: evalDocId || null, questions: evalQuestions,
+        answer_model: evalAnswerModel, verify_model: evalVerifyModel, temperature: evalTemp,
+        voice_id: evalSpeak ? "openai-alloy" : null,
+      });
+      setEvalResults(res.results);
+      setEvalSummary({ accuracy: res.accuracy, counts: res.counts, answer_model: res.answer_model, verify_model: res.verify_model });
+    } catch (e: any) { setEvalErr(e.message); }
+    finally { setEvalBusy(null); }
+  };
+
+  const handleDocChatSend = async () => {
+    const text = docChatInput.trim();
+    if (!text || !selectedCol) return;
+    setDocChatInput("");
+    setDocChatLog(l => [...l, { role: "user", text }]);
+    setDocChatBusy(true);
+    try {
+      const res = await chatWithDocument({
+        text, collection_id: selectedCol.id, document_id: evalDocId || null,
+        llm_provider_id: evalAnswerModel, temperature: evalTemp,
+        voice_id: evalSpeak ? "openai-alloy" : null,
+      });
+      setDocChatLog(l => [...l, { role: "ai", text: res.response || "(no answer)", rag: !!res.rag_used, audio: res.audio_url }]);
+      if (evalSpeak && res.audio_url) { try { new Audio(absoluteAudioUrl(res.audio_url) || "").play(); } catch {} }
+    } catch (e: any) {
+      setDocChatLog(l => [...l, { role: "ai", text: "Error: " + e.message }]);
+    } finally { setDocChatBusy(false); }
+  };
+
   // ── Analytics ─────────────────────────────────────────────────────────────
   const loadAnalytics = async () => {
     setAnalyticsLoading(true);
@@ -2639,6 +2711,12 @@ function KnowledgeView({
             <button className={`rag-toolbar-btn ${panel === "search" ? "active" : ""}`} onClick={() => setPanel(p => p === "search" ? null : "search")}>
               <Search size={14} /><span>Search</span>
             </button>
+            {/* Evaluate */}
+            {selectedCol && (
+              <button className={`rag-toolbar-btn ${panel === "eval" ? "active" : ""}`} onClick={() => setPanel(p => p === "eval" ? null : "eval")}>
+                <CheckCircle2 size={14} /><span>Evaluate</span>
+              </button>
+            )}
             {/* Analytics */}
             <button className={`rag-toolbar-btn ${panel === "analytics" ? "active" : ""}`} onClick={() => setPanel(p => p === "analytics" ? null : "analytics")}>
               <Activity size={14} /><span>Analytics</span>
@@ -3144,6 +3222,137 @@ function KnowledgeView({
               {searchResults.length === 0 && searchMeta && !searching && (
                 <div className="rag-empty"><div className="rag-empty-icon"><Search size={22} /></div><h3>No results</h3><p>Lower min score or try different terms.</p></div>
               )}
+            </div>
+          </div>
+        )}
+
+        {panel === "eval" && selectedCol && (
+          <div className="rag-panel-overlay">
+            <div className="rag-panel-header">
+              <CheckCircle2 size={18} style={{ color: "var(--teal)" }} />
+              <h2>Evaluate &amp; Chat — {selectedCol.name}</h2>
+              <button onClick={() => setPanel(null)} style={{ marginLeft: "auto", background: "none", border: "none", color: "var(--muted)", cursor: "pointer", padding: "0 4px" }}>✕</button>
+            </div>
+            <div className="rag-panel-body">
+              {/* Controls */}
+              <div className="eval-controls">
+                <div className="eval-field">
+                  <label>Scope</label>
+                  <select value={evalDocId} onChange={e => { setEvalDocId(e.target.value); setEvalQuestions([]); setEvalResults(null); setEvalSummary(null); }}>
+                    <option value="">Whole collection ({documents.length} docs)</option>
+                    {documents.map(d => <option key={d.id} value={d.id}>{d.filename} ({d.chunk_count} chunks)</option>)}
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label>Answer model</label>
+                  <select value={evalAnswerModel} onChange={e => setEvalAnswerModel(e.target.value)}>
+                    <option value="local">Local (Ollama)</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="gemini">Gemini</option>
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label>Verify model</label>
+                  <select value={evalVerifyModel} onChange={e => setEvalVerifyModel(e.target.value)}>
+                    <option value="openai">OpenAI</option>
+                    <option value="gemini">Gemini</option>
+                    <option value="local">Local (Ollama)</option>
+                  </select>
+                </div>
+                <div className="eval-field">
+                  <label># Questions: <b>{evalN}</b></label>
+                  <input type="range" min={1} max={20} value={evalN} onChange={e => setEvalN(Number(e.target.value))} />
+                </div>
+                <div className="eval-field">
+                  <label>Temperature: <b>{evalTemp.toFixed(2)}</b></label>
+                  <input type="range" min={0} max={1} step={0.05} value={evalTemp} onChange={e => setEvalTemp(Number(e.target.value))} />
+                </div>
+                <label className="eval-speak">
+                  <input type="checkbox" checked={evalSpeak} onChange={e => setEvalSpeak(e.target.checked)} />
+                  <span>🔊 Speak answers (voice)</span>
+                </label>
+              </div>
+              <div className="eval-actions">
+                <button className="rag-toolbar-btn primary" onClick={handleGenerateQuestions} disabled={evalBusy !== null}>
+                  {evalBusy === "gen" ? <RefreshCw size={13} className="spin" /> : <Sparkles size={13} />}
+                  <span>{evalBusy === "gen" ? "Generating…" : "Generate questions"}</span>
+                </button>
+                <button className="rag-toolbar-btn" onClick={handleRunEval} disabled={evalBusy !== null || !evalQuestions.length}>
+                  {evalBusy === "run" ? <RefreshCw size={13} className="spin" /> : <Activity size={13} />}
+                  <span>{evalBusy === "run" ? "Evaluating…" : `Run evaluation (${evalQuestions.length})`}</span>
+                </button>
+                <span className="eval-scope-note">Scope: {evalScopeLabel}</span>
+              </div>
+              {evalErr && <div className="eval-err"><CircleAlert size={14} /> {evalErr}</div>}
+
+              {/* Generated questions preview */}
+              {evalQuestions.length > 0 && !evalResults && (
+                <div className="eval-section">
+                  <div className="eval-section-title">{evalQuestions.length} questions delivered from {evalScopeLabel}</div>
+                  <ol className="eval-qlist">
+                    {evalQuestions.map((q, i) => <li key={i}><b>{q.q}</b><span>{q.a}</span></li>)}
+                  </ol>
+                </div>
+              )}
+
+              {/* Results scoreboard */}
+              {evalSummary && (
+                <div className="eval-scoreboard">
+                  <div className="eval-score-main">
+                    <div className="eval-accuracy">{evalSummary.accuracy}%</div>
+                    <div className="eval-score-sub">accuracy<br /><span>{evalSummary.answer_model} answered · {evalSummary.verify_model} verified</span></div>
+                  </div>
+                  <div className="eval-score-pills">
+                    <span className="pill good">✓ {evalSummary.counts.correct} correct</span>
+                    <span className="pill warn">~ {evalSummary.counts.partial} partial</span>
+                    <span className="pill" style={{ color: "var(--rose)" }}>✗ {evalSummary.counts.incorrect} incorrect</span>
+                    {evalSummary.counts.error > 0 && <span className="pill">⚠ {evalSummary.counts.error} error</span>}
+                  </div>
+                </div>
+              )}
+
+              {/* Results table */}
+              {evalResults && (
+                <div className="eval-section">
+                  <div className="eval-section-title">Detailed results</div>
+                  {evalResults.map((r, i) => (
+                    <div key={i} className={`eval-row v-${r.verdict}`}>
+                      <div className="eval-row-head">
+                        <span className={`eval-verdict v-${r.verdict}`}>{r.verdict}</span>
+                        <span className="eval-q">{r.question}</span>
+                        {r.rag_used && <span className="pill good">RAG</span>}
+                        <span className="eval-lat">{r.latency_s}s</span>
+                      </div>
+                      <div className="eval-row-body">
+                        <div><b>Expected:</b> {r.reference}</div>
+                        <div><b>Answer:</b> {r.answer}</div>
+                        {r.reason && <div className="eval-reason"><b>Judge:</b> {r.reason}</div>}
+                        {r.audio_url && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(r.audio_url!) || "").play(); } catch {} }}><Volume2 size={12} /> Play</button>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Chat with this document */}
+              <div className="eval-section">
+                <div className="eval-section-title"><Radio size={13} /> Chat with {evalDocId ? "this document" : "this collection"} ({evalAnswerModel}, temp {evalTemp.toFixed(2)})</div>
+                <div className="doc-chat-log">
+                  {docChatLog.length === 0 && <div className="doc-chat-empty">Ask a question grounded in {evalScopeLabel}.</div>}
+                  {docChatLog.map((m, i) => (
+                    <div key={i} className={`doc-chat-msg ${m.role}`}>
+                      <span className="doc-chat-role">{m.role === "user" ? "You" : "AI"}{m.rag ? " · RAG" : ""}</span>
+                      <div>{m.text}</div>
+                      {m.audio && <button className="rag-toolbar-btn" onClick={() => { try { new Audio(absoluteAudioUrl(m.audio!) || "").play(); } catch {} }}><Volume2 size={12} /></button>}
+                    </div>
+                  ))}
+                  {docChatBusy && <div className="doc-chat-msg ai"><RefreshCw size={13} className="spin" /> thinking…</div>}
+                </div>
+                <form className="doc-chat-input" onSubmit={e => { e.preventDefault(); void handleDocChatSend(); }}>
+                  <input value={docChatInput} onChange={e => setDocChatInput(e.target.value)} placeholder="Ask about this document…" disabled={docChatBusy} />
+                  <button type="submit" className="rag-toolbar-btn primary" disabled={docChatBusy || !docChatInput.trim()}><Send size={13} /></button>
+                </form>
+              </div>
             </div>
           </div>
         )}

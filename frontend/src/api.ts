@@ -544,6 +544,50 @@ export async function exportKBCollection(collectionId: string): Promise<any> {
   return r.ok ? r.json() : null;
 }
 
+// ── RAG Evaluation ──
+export interface EvalQA { q: string; a: string }
+export async function kbEvalGenerate(opts: {
+  collection_id: string; document_id?: string | null; n: number; gen_model?: string;
+}): Promise<{ ok: boolean; count: number; questions: EvalQA[]; gen_model: string }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/generate`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Question generation failed."); }
+  return r.json();
+}
+
+export interface EvalRow {
+  question: string; reference: string; answer: string; rag_used: boolean;
+  verdict: "correct" | "partial" | "incorrect" | "error"; reason: string; latency_s: number; audio_url: string | null;
+}
+export async function kbEvalRun(opts: {
+  collection_id: string; document_id?: string | null; questions: EvalQA[];
+  answer_model: string; verify_model: string; temperature: number; voice_id?: string | null;
+}): Promise<{ ok: boolean; answer_model: string; verify_model: string; total: number; accuracy: number;
+  counts: Record<string, number>; results: EvalRow[] }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/run`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Evaluation failed."); }
+  return r.json();
+}
+
+// Chat scoped to a specific document (or whole collection) with model + temperature control.
+export async function chatWithDocument(opts: {
+  text: string; collection_id: string; document_id?: string | null;
+  llm_provider_id: string; temperature: number; voice_id?: string | null;
+}): Promise<any> {
+  const r = await fetch(`${API_HTTP}/chat/test`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      text: opts.text, knowledge_id: opts.collection_id, document_id: opts.document_id || undefined,
+      llm_provider_id: opts.llm_provider_id, temperature: opts.temperature, voice_id: opts.voice_id || undefined,
+    }),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Chat failed."); }
+  return r.json();
+}
+
 // ============================================================
 // Legacy RAG (Open WebUI) API
 // ============================================================

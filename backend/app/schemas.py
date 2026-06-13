@@ -95,6 +95,8 @@ class ChatTestRequest(BaseModel):
     use_internet: bool = False
     llm_provider_id: str | None = None
     stt_provider_id: str | None = None
+    document_id: str | None = None
+    temperature: float | None = None
 
 
 

@@ -879,6 +879,7 @@ class RAGService:
         collection_ids: list[str],
         n: int,
         source_type_filter: str | None = None,
+        doc_id_filter: str | None = None,
     ) -> list[KBSearchResult]:
         # Auto-reindex any target collection whose stored embedding dimension no
         # longer matches the active provider, so a provider switch never hard-breaks
@@ -901,9 +902,12 @@ class RAGService:
                 if count == 0:
                     continue
 
-                where_filter = None
+                conds = []
                 if source_type_filter:
-                    where_filter = {"source_type": source_type_filter}
+                    conds.append({"source_type": source_type_filter})
+                if doc_id_filter:
+                    conds.append({"doc_id": doc_id_filter})
+                where_filter = conds[0] if len(conds) == 1 else ({"$and": conds} if conds else None)
 
                 query_kwargs: dict[str, Any] = {
                     "query_embeddings": [query_embedding],
@@ -1128,6 +1132,7 @@ class RAGService:
         mode: str | None = None,
         source_type_filter: str | None = None,
         rerank: bool | None = None,
+        doc_id_filter: str | None = None,
     ) -> list[KBSearchResult]:
         n = n_results or self.max_results
         collections = collection_ids or list(self._meta.keys())
@@ -1135,6 +1140,10 @@ class RAGService:
             return []
 
         search_mode = mode or self.search_mode
+        # Document-scoped retrieval needs the chroma where-filter, which only the
+        # semantic path applies — force semantic mode when a single doc is targeted.
+        if doc_id_filter:
+            search_mode = "semantic"
         do_rerank = rerank if rerank is not None else self.reranking_enabled
 
         t0 = time.time()
@@ -1144,7 +1153,7 @@ class RAGService:
         elif search_mode == "hybrid":
             results = self._hybrid_search_rrf(query_text, collections, n, source_type_filter)
         else:
-            results = self._semantic_search(query_text, collections, n, source_type_filter)
+            results = self._semantic_search(query_text, collections, n, source_type_filter, doc_id_filter)
 
         if do_rerank and results:
             results = self._rerank(query_text, results)
@@ -1198,8 +1207,8 @@ class RAGService:
             "context": self._build_context_from_results(results),
         }
 
-    def build_context(self, query_text: str, collection_ids: list[str] | None = None) -> str:
-        results = self.query(query_text, collection_ids)
+    def build_context(self, query_text: str, collection_ids: list[str] | None = None, doc_id: str | None = None) -> str:
+        results = self.query(query_text, collection_ids, doc_id_filter=doc_id)
         return self._build_context_from_results(results)
 
     def _build_context_from_results(self, results: list[KBSearchResult]) -> str:

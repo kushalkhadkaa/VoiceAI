@@ -1082,8 +1082,140 @@ def chat_test(payload: ChatTestRequest):
         use_internet=payload.use_internet,
         llm_provider_id=payload.llm_provider_id,
         stt_provider_id=payload.stt_provider_id,
+        document_id=payload.document_id,
+        temperature=payload.temperature,
     )
 
+
+# ── RAG Evaluation: generate questions from a document, answer with one model,
+#    verify the answers with a second model ──────────────────────────────────
+def _extract_json(text: str) -> dict:
+    """Best-effort JSON extraction — tolerates qwen <think> blocks and code fences."""
+    import re
+    if not text:
+        return {}
+    # strip thinking traces / code fences
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = text.replace("```json", "").replace("```", "")
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    m = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            return {}
+    return {}
+
+
+def _eval_gen_provider(provider_id: str | None):
+    pid = provider_id or ("openai" if settings.openai_api_key else "local")
+    return conversation_service._instantiate_provider(pid), pid
+
+
+@app.post("/kb/eval/generate")
+def kb_eval_generate(payload: dict):
+    from fastapi import HTTPException
+    cid = (payload.get("collection_id") or "").strip()
+    doc_id = (payload.get("document_id") or "").strip() or None
+    n = max(1, min(int(payload.get("n", 5)), 20))
+    if not cid:
+        raise HTTPException(status_code=400, detail="collection_id is required.")
+
+    # Gather source text — a single document, or a spread across the collection.
+    chunks: list[dict] = []
+    if doc_id:
+        chunks = kb_service.get_document_chunks(cid, doc_id, limit=40)
+    else:
+        for d in kb_service.list_documents(cid):
+            chunks.extend(kb_service.get_document_chunks(cid, d.id, limit=4))
+    chunks = [c for c in chunks if len((c.get("text") or "").strip()) > 100]
+    if not chunks:
+        raise HTTPException(status_code=400, detail="No indexed text found to generate questions from.")
+    source = "\n\n".join(c["text"] for c in chunks)[:7000]
+
+    provider, used = _eval_gen_provider(payload.get("gen_model"))
+    prompt = (
+        f"From the bank document text below, write exactly {n} factual question/answer pairs that each test "
+        f"a SPECIFIC fact explicitly stated in the text. Every question must be self-contained (name its subject; "
+        f"never use 'it'/'this'). Answers must be short and taken directly from the text. "
+        f'Return ONLY JSON: {{"qas":[{{"q":"...","a":"..."}}]}}.\n\nTEXT:\n{source}'
+    )
+    try:
+        result = provider.chat(prompt, system_prompt="You output only valid minified JSON. No prose.")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Question generation failed: {exc}")
+    qas = [
+        {"q": (x.get("q") or "").strip(), "a": (x.get("a") or "").strip()}
+        for x in _extract_json(result.text).get("qas", [])
+        if (x.get("q") or "").strip() and (x.get("a") or "").strip()
+    ][:n]
+    return {"ok": True, "count": len(qas), "questions": qas,
+            "collection_id": cid, "document_id": doc_id, "gen_model": used}
+
+
+@app.post("/kb/eval/run")
+def kb_eval_run(payload: dict):
+    from fastapi import HTTPException
+    import time
+    cid = (payload.get("collection_id") or "").strip()
+    doc_id = (payload.get("document_id") or "").strip() or None
+    questions = payload.get("questions") or []
+    answer_model = payload.get("answer_model") or "local"
+    verify_model = payload.get("verify_model") or ("openai" if settings.openai_api_key else "local")
+    temperature = payload.get("temperature")
+    voice_id = (payload.get("voice_id") or "").strip() or None
+    if not cid or not questions:
+        raise HTTPException(status_code=400, detail="collection_id and questions are required.")
+
+    verifier = conversation_service._instantiate_provider(verify_model)
+    rows = []
+    counts = {"correct": 0, "partial": 0, "incorrect": 0, "error": 0}
+    for item in questions[:20]:
+        q = (item.get("q") or "").strip()
+        ref = (item.get("a") or "").strip()
+        if not q:
+            continue
+        t0 = time.time()
+        try:
+            ans_resp = conversation_service.handle_text(
+                q, voice_id=voice_id, knowledge_id=cid, document_id=doc_id,
+                llm_provider_id=answer_model, temperature=temperature,
+            )
+            ans = ans_resp.response or ""
+            rag_used = bool(getattr(ans_resp, "rag_used", False))
+            audio_url = getattr(ans_resp, "audio_url", None)
+        except Exception as exc:
+            ans, rag_used, audio_url = f"(error: {exc})", False, None
+        latency = round(time.time() - t0, 1)
+
+        # Verify with the second model.
+        try:
+            jprompt = (
+                f"QUESTION: {q}\nREFERENCE ANSWER (from the source document): {ref}\n"
+                f"SYSTEM ANSWER: {ans[:1200]}\n\n"
+                'Grade whether the SYSTEM ANSWER is factually correct and consistent with the reference. '
+                '"correct" = right fact; "partial" = on-topic but incomplete; "incorrect" = wrong/refuses/empty. '
+                'Return ONLY JSON: {"verdict":"correct|partial|incorrect","reason":"<short>"}'
+            )
+            jres = verifier.chat(jprompt, system_prompt="You are a strict grader. Output only JSON.")
+            jd = _extract_json(jres.text)
+            verdict = jd.get("verdict", "incorrect")
+            reason = jd.get("reason", "")
+        except Exception as exc:
+            verdict, reason = "error", str(exc)[:80]
+        if verdict not in counts:
+            verdict = "incorrect"
+        counts[verdict] += 1
+        rows.append({"question": q, "reference": ref, "answer": ans, "rag_used": rag_used,
+                     "verdict": verdict, "reason": reason, "latency_s": latency, "audio_url": audio_url})
+
+    n = len(rows) or 1
+    accuracy = round(100 * (counts["correct"] + 0.5 * counts["partial"]) / n, 1)
+    return {"ok": True, "answer_model": answer_model, "verify_model": verify_model,
+            "total": len(rows), "accuracy": accuracy, "counts": counts, "results": rows}
 
 
 @app.get("/chat/history")
@@ -1930,6 +2062,7 @@ async def preview_cloned_voice(voice_id: str):
     """Synthesize a short test phrase with the cloned voice so the user can hear it."""
     from fastapi import HTTPException
     from fastapi.responses import FileResponse
+    from app.database import get_db_connection
     conn = get_db_connection()
     try:
         voice = conn.execute("SELECT * FROM voices WHERE id = ?;", (voice_id,)).fetchone()
@@ -1941,7 +2074,7 @@ async def preview_cloned_voice(voice_id: str):
         conn.close()
 
     test_text = "Hello! This is how my cloned voice sounds. नमस्ते, यो मेरो क्लोन गरिएको आवाज हो।"
-    parts = language_router.route(test_text)
+    parts = [TTSPart(text=chunk, language=lang) for chunk, lang in language_router.split_for_tts(test_text)]
     try:
         result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=False)
     except Exception as exc:
