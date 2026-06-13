@@ -110,6 +110,7 @@ import {
   exportKBCollection,
   kbEvalGenerate,
   kbEvalCorrect,
+  kbEvalCorrectBulk,
   chatWithDocument,
   voiceTurnRest,
   setActiveAIProvider,
@@ -2336,13 +2337,17 @@ function KnowledgeView({
   const [evalVerifyModel, setEvalVerifyModel] = useState("openai:gpt-4o-mini");
   const [evalTemp, setEvalTemp] = useState(0.2);
   const [evalN, setEvalN] = useState(5);
+  const [evalAnswerStyle, setEvalAnswerStyle] = useState<"short" | "detailed">("detailed");
   const [evalSpeak, setEvalSpeak] = useState(false);
   const [evalVoice, setEvalVoice] = useState("openai-alloy");
   const [evalVoices, setEvalVoices] = useState<any[]>([]);
-  const [evalProgress, setEvalProgress] = useState<{ done: number; total: number } | null>(null);
+  const [evalProgress, setEvalProgress] = useState<{ done: number; total: number; startedAt?: number; etaSeconds?: number | null } | null>(null);
   const [evalFixIdx, setEvalFixIdx] = useState<number | null>(null);
   const [evalFixText, setEvalFixText] = useState("");
   const [evalFixedQ, setEvalFixedQ] = useState<Set<string>>(new Set());
+  const [evalSelectedFixes, setEvalSelectedFixes] = useState<Set<string>>(new Set());
+  const [evalBulkFixing, setEvalBulkFixing] = useState(false);
+  const [evalDocsUsed, setEvalDocsUsed] = useState<string[]>([]);
   const [evalQuestions, setEvalQuestions] = useState<EvalQA[]>([]);
   const [evalResults, setEvalResults] = useState<EvalRow[] | null>(null);
   const [evalSummary, setEvalSummary] = useState<{ accuracy: number; counts: Record<string, number>; answer_model: string; verify_model: string } | null>(null);
@@ -2615,12 +2620,14 @@ function KnowledgeView({
 
   const handleGenerateQuestions = async () => {
     if (!selectedCol) return;
-    setEvalBusy("gen"); setEvalErr(null); setEvalResults(null); setEvalSummary(null);
+    setEvalBusy("gen"); setEvalErr(null); setEvalResults(null); setEvalSummary(null); setEvalDocsUsed([]);
     try {
       const res = await kbEvalGenerate({
         collection_id: selectedCol.id, document_id: evalDocId || null, n: evalN, gen_model: "openai",
+        answer_style: evalAnswerStyle,
       });
       setEvalQuestions(res.questions);
+      setEvalDocsUsed(res.documents_used ?? []);
       if (!res.questions.length) setEvalErr("No questions could be generated from this scope.");
     } catch (e: any) { setEvalErr(e.message); }
     finally { setEvalBusy(null); }
@@ -2631,7 +2638,9 @@ function KnowledgeView({
   const handleRunEval = async () => {
     if (!selectedCol || !evalQuestions.length) return;
     setEvalBusy("run"); setEvalErr(null); setEvalResults([]); setEvalSummary(null);
-    setEvalProgress({ done: 0, total: evalQuestions.length }); setEvalFixIdx(null);
+    setEvalSelectedFixes(new Set());
+    const startedAt = Date.now();
+    setEvalProgress({ done: 0, total: evalQuestions.length, startedAt, etaSeconds: null }); setEvalFixIdx(null);
     try {
       const resp = await fetch(`${API_HTTP}/kb/eval/run-stream`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -2660,10 +2669,13 @@ function KnowledgeView({
           let evt: any;
           try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
           if (evt.type === "start") {
-            setEvalProgress({ done: 0, total: evt.total });
+            setEvalProgress({ done: 0, total: evt.total, startedAt, etaSeconds: null });
           } else if (evt.type === "result") {
             setEvalResults(prev => [...(prev || []), evt.result]);
-            setEvalProgress({ done: evt.index, total: evt.total });
+            const elapsed = (Date.now() - startedAt) / 1000;
+            const avg = elapsed / Math.max(1, evt.index);
+            const etaSeconds = Math.max(0, Math.round(avg * (evt.total - evt.index)));
+            setEvalProgress({ done: evt.index, total: evt.total, startedAt, etaSeconds });
             setEvalSummary({ accuracy: evt.accuracy, counts: evt.counts, answer_model: evalAnswerModel, verify_model: evalVerifyModel });
             if (evalSpeak && evt.result?.audio_url) { try { new Audio(absoluteAudioUrl(evt.result.audio_url) || "").play(); } catch { /* ignore */ } }
           } else if (evt.type === "done") {
@@ -2684,6 +2696,32 @@ function KnowledgeView({
       setEvalFixIdx(null);
       void refresh();   // refresh chunk/doc counts so the new correction shows up
     } catch (e: any) { setEvalErr(e.message); }
+  };
+
+  const handleBulkFixInKB = async () => {
+    if (!selectedCol || !evalResults) return;
+    const selected = evalResults.filter(r => evalSelectedFixes.has(r.question));
+    if (!selected.length) return;
+    setEvalBulkFixing(true); setEvalErr(null);
+    try {
+      await kbEvalCorrectBulk({
+        collection_id: selectedCol.id,
+        items: selected.map(r => ({
+          question: r.question,
+          answer: r.reference,
+          source_doc: r.source_doc,
+          verdict: r.verdict,
+        })),
+      });
+      setEvalFixedQ(prev => {
+        const next = new Set(prev);
+        selected.forEach(r => next.add(r.question));
+        return next;
+      });
+      setEvalSelectedFixes(new Set());
+      void refresh();
+    } catch (e: any) { setEvalErr(e.message); }
+    finally { setEvalBulkFixing(false); }
   };
 
   const handleDocChatSend = async () => {
@@ -2739,6 +2777,10 @@ function KnowledgeView({
 
   // ── Derived ────────────────────────────────────────────────────────────────
   const embOk = kbStatus?.embedding?.ok;
+  const evalFixableRows = evalResults?.filter(r => (r.verdict === "incorrect" || r.verdict === "partial") && !evalFixedQ.has(r.question)) ?? [];
+  const evalSelectedFixCount = evalFixableRows.filter(r => evalSelectedFixes.has(r.question)).length;
+  const evalEtaText = evalProgress?.etaSeconds != null ? `ETA ${formatUptime(evalProgress.etaSeconds)}` : "Calculating ETA";
+  const evalExpectedTime = `${evalSpeak ? "~12-35s" : "~3-15s"} per question depending on selected models${evalSpeak ? " and voice synthesis" : ""}`;
   const filteredDocs = documents.filter(d =>
     d.filename.toLowerCase().includes(docSearch.toLowerCase()) ||
     (d.source_url ?? "").toLowerCase().includes(docSearch.toLowerCase())
@@ -2763,6 +2805,11 @@ function KnowledgeView({
               : <span className="rag-status-badge err" style={{ marginLeft: "auto", fontSize: 10 }}><CircleAlert size={10} />Offline</span>}
           </h2>
           <p>{collections.length} knowledge base{collections.length !== 1 ? "s" : ""}</p>
+          {kbStatus && (
+            <div className="rag-kb-path" title={kbStatus.db_path}>
+              {kbStatus.document_count} docs · {kbStatus.chunk_count} chunks
+            </div>
+          )}
         </div>
 
         <div className="rag-col-list">
@@ -2783,8 +2830,15 @@ function KnowledgeView({
           {collections.length === 0 && !serviceDown && (
             <div style={{ padding: "20px 8px", textAlign: "center", color: "var(--muted)", fontSize: 12 }}>
               <Database size={28} style={{ opacity: 0.3, marginBottom: 8 }} />
-              <div>No knowledge bases yet.</div>
-              <div>Create one below.</div>
+              <div style={{ color: "var(--ink)", fontWeight: 700 }}>No knowledge bases loaded here.</div>
+              <div style={{ lineHeight: 1.5, marginTop: 6 }}>
+                This means the current backend has no indexed collections in its local KB path.
+                Your documents are not deleted by this screen.
+              </div>
+              <div className="rag-empty-fix">
+                <b>Fix:</b> create a knowledge base below, import documents, or confirm the app is using backend
+                <code>127.0.0.1:8001</code> and repo <code>/Users/kushalkhadka/VoiceAI</code>.
+              </div>
             </div>
           )}
           {collections.map((col, i) => (
@@ -2951,8 +3005,21 @@ function KnowledgeView({
             /* ── No collection selected ── */
             <div className="rag-empty" style={{ paddingTop: 80 }}>
               <div className="rag-empty-icon"><Database size={28} /></div>
-              <h3>Select a Knowledge Base</h3>
-              <p>Choose a knowledge base from the sidebar, or create one to start adding documents.</p>
+              <h3>{collections.length ? "Select a Knowledge Base" : "RAG Is Ready, But No Collection Is Selected"}</h3>
+              <p>
+                {collections.length
+                  ? "Choose a knowledge base from the sidebar to browse documents, search, chat, or evaluate it."
+                  : serviceDown
+                    ? "The backend knowledge API is not responding right now. The pulse checker will reconnect automatically and show the exact reason."
+                    : "No collection is loaded in this backend session. Create one or import your documents; if you expected existing data, check that the app is connected to the active backend on port 8001."}
+              </p>
+              {kbStatus && (
+                <div className="rag-diagnostic-card">
+                  <b>Current KB path</b>
+                  <code>{kbStatus.db_path}</code>
+                  <span>{kbStatus.collection_count} collection(s), {kbStatus.document_count} document(s), {kbStatus.chunk_count} chunk(s)</span>
+                </div>
+              )}
               <button className="rag-toolbar-btn primary" style={{ marginTop: 4 }} onClick={() => setPanel("newcol")}>
                 <Plus size={14} /><span>Create Knowledge Base</span>
               </button>
@@ -3422,7 +3489,15 @@ function KnowledgeView({
                 </div>
                 <div className="eval-field">
                   <label># Questions: <b>{evalN}</b></label>
-                  <input type="range" min={1} max={20} value={evalN} onChange={e => setEvalN(Number(e.target.value))} />
+                  <input type="range" min={1} max={100} value={evalN} onChange={e => setEvalN(Number(e.target.value))} />
+                  <input type="number" min={1} max={100} value={evalN} onChange={e => setEvalN(Math.max(1, Math.min(100, Number(e.target.value) || 1)))} />
+                </div>
+                <div className="eval-field">
+                  <label>Reference answer depth</label>
+                  <select value={evalAnswerStyle} onChange={e => setEvalAnswerStyle(e.target.value as "short" | "detailed")}>
+                    <option value="detailed">Detailed when needed</option>
+                    <option value="short">Exact short facts</option>
+                  </select>
                 </div>
                 <div className="eval-field">
                   <label>Temperature: <b>{evalTemp.toFixed(2)}</b></label>
@@ -3464,6 +3539,12 @@ function KnowledgeView({
                 </button>
                 <span className="eval-scope-note">Scope: {evalScopeLabel}</span>
               </div>
+              <div className="eval-guidance">
+                <Info size={14} />
+                <span>
+                  Generation now samples across documents in the selected collection. Evaluation can take time because each question is answered, retrieved from KB, then judged by a verifier. Expected: {evalExpectedTime}. Keep "Speak answers" off for the fastest run.
+                </span>
+              </div>
               {evalErr && <div className="eval-err"><CircleAlert size={14} /> {evalErr}</div>}
 
               {/* Animated progress while evaluating */}
@@ -3472,6 +3553,7 @@ function KnowledgeView({
                   <div className="eval-progress-head">
                     <span className="eval-progress-spinner"><RefreshCw size={13} className="spin" /></span>
                     <span>Evaluating question <b>{Math.min(evalProgress.done + (evalBusy === "run" ? 1 : 0), evalProgress.total)}</b> of <b>{evalProgress.total}</b></span>
+                    <span className="eval-progress-eta">{evalEtaText}</span>
                     <span className="eval-progress-pct">{Math.round((evalProgress.done / Math.max(1, evalProgress.total)) * 100)}%</span>
                   </div>
                   <div className="eval-progress-track">
@@ -3491,8 +3573,13 @@ function KnowledgeView({
               {evalQuestions.length > 0 && !evalResults && (
                 <div className="eval-section">
                   <div className="eval-section-title">{evalQuestions.length} questions delivered from {evalScopeLabel}</div>
+                  {evalDocsUsed.length > 0 && (
+                    <div className="eval-doc-coverage">
+                      Covered {evalDocsUsed.length} source document{evalDocsUsed.length === 1 ? "" : "s"}: {evalDocsUsed.slice(0, 8).join(", ")}{evalDocsUsed.length > 8 ? ` +${evalDocsUsed.length - 8} more` : ""}
+                    </div>
+                  )}
                   <ol className="eval-qlist">
-                    {evalQuestions.map((q, i) => <li key={i}><b>{q.q}</b><span>{q.a}</span></li>)}
+                    {evalQuestions.map((q, i) => <li key={i}><b>{q.q}</b><span>{q.a}</span>{q.source_doc && <em>{q.source_doc}{q.dimension ? ` · ${q.dimension}` : ""}</em>}</li>)}
                   </ol>
                 </div>
               )}
@@ -3517,18 +3604,55 @@ function KnowledgeView({
               {evalResults && (
                 <div className="eval-section">
                   <div className="eval-section-title">Detailed results</div>
+                  {evalFixableRows.length > 0 && (
+                    <div className="eval-bulk-fix">
+                      <label>
+                        <input
+                          type="checkbox"
+                          checked={evalSelectedFixCount === evalFixableRows.length}
+                          onChange={e => {
+                            if (e.target.checked) {
+                              setEvalSelectedFixes(new Set(evalFixableRows.map(r => r.question)));
+                            } else {
+                              setEvalSelectedFixes(new Set());
+                            }
+                          }}
+                        />
+                        <span>Select all partial/incorrect answers ({evalFixableRows.length})</span>
+                      </label>
+                      <button className="rag-toolbar-btn primary" onClick={handleBulkFixInKB} disabled={evalBulkFixing || evalSelectedFixCount === 0}>
+                        {evalBulkFixing ? <RefreshCw size={12} className="spin" /> : <Wand2 size={12} />}
+                        Bulk fix selected ({evalSelectedFixCount})
+                      </button>
+                      <small>Uses the verified expected answers as a curated correction pack.</small>
+                    </div>
+                  )}
                   {evalResults.map((r, i) => {
                     const needsFix = r.verdict === "incorrect" || r.verdict === "partial";
                     const fixed = evalFixedQ.has(r.question);
                     return (
                     <div key={i} className={`eval-row v-${r.verdict} eval-row-reveal`}>
                       <div className="eval-row-head">
+                        {needsFix && !fixed && (
+                          <input
+                            type="checkbox"
+                            checked={evalSelectedFixes.has(r.question)}
+                            onChange={e => setEvalSelectedFixes(prev => {
+                              const next = new Set(prev);
+                              if (e.target.checked) next.add(r.question); else next.delete(r.question);
+                              return next;
+                            })}
+                            title="Select for bulk fix"
+                          />
+                        )}
                         <span className={`eval-verdict v-${r.verdict}`}>{r.verdict}</span>
+                        {typeof r.score === "number" && <span className="eval-score-chip">{r.score}%</span>}
                         <span className="eval-q">{r.question}</span>
                         {r.rag_used && <span className="pill good">RAG</span>}
                         <span className="eval-lat">{r.latency_s}s</span>
                       </div>
                       <div className="eval-row-body">
+                        {(r.source_doc || r.dimension) && <div className="eval-source"><b>Source:</b> {r.source_doc || "unknown"}{r.dimension ? ` · ${r.dimension}` : ""}</div>}
                         <div><b>Expected:</b> {r.reference}</div>
                         <div><b>Answer:</b> {r.answer}</div>
                         {r.reason && <div className="eval-reason"><b>Judge:</b> {r.reason}</div>}

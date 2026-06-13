@@ -564,10 +564,10 @@ export async function exportKBCollection(collectionId: string): Promise<any> {
 }
 
 // ── RAG Evaluation ──
-export interface EvalQA { q: string; a: string }
+export interface EvalQA { q: string; a: string; source_doc?: string; dimension?: string }
 export async function kbEvalGenerate(opts: {
-  collection_id: string; document_id?: string | null; n: number; gen_model?: string;
-}): Promise<{ ok: boolean; count: number; questions: EvalQA[]; gen_model: string }> {
+  collection_id: string; document_id?: string | null; n: number; gen_model?: string; answer_style?: "short" | "detailed";
+}): Promise<{ ok: boolean; count: number; questions: EvalQA[]; gen_model: string; documents_used?: string[] }> {
   const r = await fetch(`${API_HTTP}/kb/eval/generate`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
   });
@@ -577,7 +577,8 @@ export async function kbEvalGenerate(opts: {
 
 export interface EvalRow {
   question: string; reference: string; answer: string; rag_used: boolean;
-  verdict: "correct" | "partial" | "incorrect" | "error"; reason: string; latency_s: number; audio_url: string | null;
+  verdict: "correct" | "partial" | "incorrect" | "error"; score?: number; reason: string; latency_s: number; audio_url: string | null;
+  source_doc?: string | null; dimension?: string | null;
 }
 export async function kbEvalRun(opts: {
   collection_id: string; document_id?: string | null; questions: EvalQA[];
@@ -599,6 +600,17 @@ export async function kbEvalCorrect(opts: {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
   });
   if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Could not save correction."); }
+  return r.json();
+}
+
+export async function kbEvalCorrectBulk(opts: {
+  collection_id: string;
+  items: Array<{ question: string; answer: string; source_doc?: string | null; verdict?: string }>;
+}): Promise<{ ok: boolean; count: number; document_id?: string; filename?: string }> {
+  const r = await fetch(`${API_HTTP}/kb/eval/correct-bulk`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(opts),
+  });
+  if (!r.ok) { const d = await r.json().catch(() => null); throw new Error(d?.detail ?? "Could not save bulk corrections."); }
   return r.json();
 }
 
