@@ -274,7 +274,12 @@ class ConversationService:
                 is_cloud_voice = True
 
         target_provider = llm_provider_id or self.settings.llm_provider or "local"
-        if (is_cloud_stt or is_cloud_voice) and target_provider in ("local", "auto"):
+        # Auto-upgrade a default/local selection to cloud only when the caller did
+        # NOT explicitly choose a provider — an explicit llm_provider_id is always
+        # honored. The coupling exists so a cloud STT/voice turn keeps a consistent
+        # cloud LLM; it must not override a deliberate "use the local model" request.
+        explicit_provider = bool(llm_provider_id)
+        if not explicit_provider and (is_cloud_stt or is_cloud_voice) and target_provider in ("local", "auto"):
             actual_provider = "openai"
         else:
             if target_provider == "auto":
