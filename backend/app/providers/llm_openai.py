@@ -82,32 +82,46 @@ class OpenAILLMProvider:
             method="POST",
         )
 
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                resp_data = json.loads(response.read().decode("utf-8"))
-
-            total_ms = (time.perf_counter() - started) * 1000
-            choices = resp_data.get("choices", [])
-            if not choices:
-                raise ValueError("No choices returned from OpenAI chat completions.")
-
-            content = str(choices[0].get("message", {}).get("content", "")).strip()
-            return LLMResult(
-                text=content,
-                first_token_ms=total_ms,
-                total_ms=total_ms,
-                model=self.model,
-            )
-        except urllib.error.HTTPError as exc:
-            err_body = exc.read().decode("utf-8")
+        # Retry transient failures (flaky TLS, network blips, 429/5xx) — these have
+        # intermittently broken cloud calls; fail fast only on real client errors.
+        last_exc: Exception | None = None
+        for attempt in range(3):
             try:
-                err_json = json.loads(err_body)
-                err_msg = err_json.get("error", {}).get("message", err_body)
-            except Exception:
-                err_msg = err_body
-            raise RuntimeError(f"OpenAI API error ({exc.code}): {err_msg}") from exc
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI connection error: {exc}") from exc
+                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                    resp_data = json.loads(response.read().decode("utf-8"))
+
+                total_ms = (time.perf_counter() - started) * 1000
+                choices = resp_data.get("choices", [])
+                if not choices:
+                    raise ValueError("No choices returned from OpenAI chat completions.")
+
+                content = str(choices[0].get("message", {}).get("content", "")).strip()
+                return LLMResult(
+                    text=content,
+                    first_token_ms=total_ms,
+                    total_ms=total_ms,
+                    model=self.model,
+                )
+            except urllib.error.HTTPError as exc:
+                err_body = exc.read().decode("utf-8")
+                try:
+                    err_json = json.loads(err_body)
+                    err_msg = err_json.get("error", {}).get("message", err_body)
+                except Exception:
+                    err_msg = err_body
+                # 429 / 5xx are transient — retry; other 4xx are real errors — raise now.
+                if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
+                    last_exc = RuntimeError(f"OpenAI API error ({exc.code}): {err_msg}")
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"OpenAI API error ({exc.code}): {err_msg}") from exc
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"OpenAI connection error: {exc}") from exc
+        raise RuntimeError(f"OpenAI connection error: {last_exc}")
 
     def list_models(self) -> list[str]:
         """Static fallback list — always available."""

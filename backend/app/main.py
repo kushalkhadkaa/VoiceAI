@@ -1145,15 +1145,34 @@ def kb_eval_generate(payload: dict):
         f"never use 'it'/'this'). Answers must be short and taken directly from the text. "
         f'Return ONLY JSON: {{"qas":[{{"q":"...","a":"..."}}]}}.\n\nTEXT:\n{source}'
     )
-    try:
-        result = provider.chat(prompt, system_prompt="You output only valid minified JSON. No prose.")
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Question generation failed: {exc}")
-    qas = [
-        {"q": (x.get("q") or "").strip(), "a": (x.get("a") or "").strip()}
-        for x in _extract_json(result.text).get("qas", [])
-        if (x.get("q") or "").strip() and (x.get("a") or "").strip()
-    ][:n]
+    # Generation can hit transient cloud hiccups (SSL/rate-limit) or occasionally
+    # return unparseable text — retry a few times and accept the first good batch.
+    # Budget enough output tokens for N pairs — the default cloud max_tokens (180)
+    # truncates the JSON for larger N, which is what made "14 questions" fail.
+    token_budget = min(4000, n * 130 + 400)
+    gen_opts = {"max_tokens": token_budget, "num_predict": token_budget, "temperature": 0.2}
+    qas: list[dict] = []
+    last_err = None
+    for attempt in range(4):
+        try:
+            result = provider.chat(prompt, system_prompt="You output only valid minified JSON. No prose.", options=gen_opts)
+            qas = [
+                {"q": (x.get("q") or "").strip(), "a": (x.get("a") or "").strip()}
+                for x in _extract_json(result.text).get("qas", [])
+                if (x.get("q") or "").strip() and (x.get("a") or "").strip()
+            ][:n]
+            if qas:
+                break
+        except Exception as exc:
+            last_err = exc
+        # On the last retry, try a smaller source slice in case length was the issue.
+        if attempt == 2:
+            prompt = prompt.replace(source, source[:3500])
+    if not qas:
+        detail = (f"Could not generate questions (the generation model returned no usable output"
+                  + (f"; last error: {last_err}" if last_err else "")
+                  + "). Try again, pick a specific document, or switch the answer model.")
+        raise HTTPException(status_code=502, detail=detail)
     return {"ok": True, "count": len(qas), "questions": qas,
             "collection_id": cid, "document_id": doc_id, "gen_model": used}
 
