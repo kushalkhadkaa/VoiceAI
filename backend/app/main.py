@@ -941,6 +941,7 @@ def kb_crawl_site(collection_id: str, payload: dict):
     max_pages = int(payload.get("max_pages", 500))
     same_domain_only = bool(payload.get("same_domain_only", True))
     delay_ms = int(payload.get("delay_ms", 150))
+    render_js = bool(payload.get("render_js", True))
 
     def _stream():
         import json as _json
@@ -951,6 +952,7 @@ def kb_crawl_site(collection_id: str, payload: dict):
                 max_pages=max_pages,
                 same_domain_only=same_domain_only,
                 delay_ms=delay_ms,
+                render_js=render_js,
             ):
                 yield f"data: {_json.dumps(event)}\n\n"
         except Exception as exc:
