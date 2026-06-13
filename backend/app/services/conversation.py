@@ -177,25 +177,26 @@ class ConversationService:
 
         collection_ids: list[str] | None = None
         rag_collection_id: str | None = None
-        if knowledge_id and knowledge_id != "none":
+        # Snapshot which collections actually exist + have indexed chunks.
+        try:
+            indexed = [c.id for c in self.kb_service.list_collections() if getattr(c, "chunk_count", 0) > 0]
+        except Exception as exc:
+            logger.warning("Unable to list KB collections: %s", exc)
+            return "", None, None
+        if not indexed:
+            # Nothing indexed yet — nothing to ground on, proceed without context.
+            return "", None, None
+
+        if knowledge_id and knowledge_id != "none" and knowledge_id in indexed:
             collection_ids = [knowledge_id]
             rag_collection_id = knowledge_id
         else:
-            try:
-                collections = self.kb_service.list_collections()
-                # Only search collections that actually have indexed chunks.
-                collection_ids = [
-                    collection.id
-                    for collection in collections
-                    if getattr(collection, "chunk_count", 0) > 0
-                ]
-                if not collection_ids:
-                    # Nothing indexed yet — nothing to ground on, proceed without context.
-                    return "", None, None
-                rag_collection_id = ",".join(collection_ids)
-            except Exception as exc:
-                logger.warning("Unable to list KB collections: %s", exc)
-                return "", None, None
+            # No selection, or a stale/deleted/invalid id — never silently fail RAG;
+            # fall back to searching every indexed collection.
+            if knowledge_id and knowledge_id != "none" and knowledge_id not in indexed:
+                logger.warning("knowledge_id %r is not an indexed collection; searching all instead.", knowledge_id)
+            collection_ids = indexed
+            rag_collection_id = ",".join(collection_ids)
 
         try:
             context = self.kb_service.build_context(query, collection_ids, doc_id=document_id)

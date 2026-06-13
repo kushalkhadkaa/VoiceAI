@@ -688,6 +688,15 @@ function App() {
     }
   }, [selectedVoiceId, selectedKnowledgeId, useInternet, selectedBrain, selectedSttProvider]);
 
+  // Reset a stale knowledge selection (e.g. a deleted collection id left in
+  // localStorage) so we never send a phantom knowledge_id that silently kills RAG.
+  useEffect(() => {
+    if (selectedKnowledgeId !== "none" && ragCollections.length > 0
+        && !ragCollections.find((c: any) => c.id === selectedKnowledgeId)) {
+      setSelectedKnowledgeId("none");
+    }
+  }, [ragCollections, selectedKnowledgeId, setSelectedKnowledgeId]);
+
 
   useEffect(() => {
     if (!voices || selectedVoiceId === "auto" || selectedVoiceId.startsWith("openai-")) {
