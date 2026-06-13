@@ -401,6 +401,14 @@ function App() {
   // On-demand TTS: text turns return instantly with no audio; synthesize only
   // when the user presses Play, then cache the result on the turn.
   const [speakingTurnId, setSpeakingTurnId] = useState<string | null>(null);
+  const [speakElapsed, setSpeakElapsed] = useState(0);
+  // Live elapsed counter while a voice is being synthesized, so the wait is visible.
+  useEffect(() => {
+    if (!speakingTurnId) { setSpeakElapsed(0); return; }
+    const start = Date.now();
+    const id = window.setInterval(() => setSpeakElapsed(Math.floor((Date.now() - start) / 1000)), 250);
+    return () => clearInterval(id);
+  }, [speakingTurnId]);
   const handleSpeakTurn = useCallback(async (turn: ConversationTurn) => {
     if (turn.audio_url) { handlePlayTurnAudio(turn.audio_url); return; }
     if (!turn.response) return;
@@ -1437,6 +1445,7 @@ function App() {
             onPlayAudio={handlePlayTurnAudio}
             onSpeakTurn={handleSpeakTurn}
             speakingTurnId={speakingTurnId}
+            speakElapsed={speakElapsed}
             onSaveSettings={saveSettings}
             sttLanguage={sttLanguage}
             onSelectSttLanguage={setSttLanguage}
@@ -1752,6 +1761,7 @@ function ConversationView({
   onPlayAudio,
   onSpeakTurn,
   speakingTurnId,
+  speakElapsed,
   onSaveSettings,
   sttLanguage,
   onSelectSttLanguage,
@@ -1798,6 +1808,7 @@ function ConversationView({
   onPlayAudio: (url: string | null | undefined) => void;
   onSpeakTurn: (turn: ConversationTurn) => void;
   speakingTurnId: string | null;
+  speakElapsed: number;
   onSaveSettings: (next: BackendSettings) => void;
   sttLanguage: "auto" | "ne" | "en";
   onSelectSttLanguage: (value: "auto" | "ne" | "en") => void;
@@ -2154,10 +2165,13 @@ function ConversationView({
                               const isSpeaking = speakingTurnId === ((turn as any).id ?? turn.response);
                               const isPlaying = !!turn.audio_url && playingAudioUrl === absoluteAudioUrl(turn.audio_url);
                               return (
-                                <button className={`play-btn ${isPlaying ? "playing" : ""}`} type="button" disabled={isSpeaking}
-                                  onClick={() => onSpeakTurn(turn)} title={turn.audio_url ? "Play audio response" : "Speak this answer"}>
+                                <button className={`play-btn ${isPlaying ? "playing" : ""} ${isSpeaking ? "speaking" : ""}`} type="button" disabled={isSpeaking}
+                                  onClick={() => onSpeakTurn(turn)}
+                                  title={isSpeaking ? "Generating the voice — please wait" : turn.audio_url ? "Play audio response" : "Speak this answer"}>
                                   {isSpeaking ? <RefreshCw size={12} className="spin" /> : isPlaying ? <Square size={12} /> : <Play size={12} />}
-                                  <span style={{ fontSize: 11, marginLeft: 3 }}>{isSpeaking ? "…" : isPlaying ? "Stop" : "Play"}</span>
+                                  <span style={{ fontSize: 11, marginLeft: 3 }}>
+                                    {isSpeaking ? `Generating voice… ${speakElapsed}s` : isPlaying ? "Stop" : "Play"}
+                                  </span>
                                 </button>
                               );
                             })()}

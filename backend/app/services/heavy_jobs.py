@@ -42,18 +42,25 @@ class HeavyJobBusy(Exception):
 
 
 class HeavyJob:
-    def __init__(self, label: str, typical_seconds: int) -> None:
+    def __init__(self, label: str, typical_seconds: int, max_hold_seconds: int | None = None) -> None:
         self.label = label
         self.typical_seconds = typical_seconds
-        self._lock = threading.Lock()
+        # After this long, a held slot is treated as stale/leaked and can be
+        # reclaimed — so a hung synthesis or an abandoned request can never wedge
+        # the gate forever and falsely report "busy" when nothing is running.
+        self.max_hold_seconds = max_hold_seconds or max(typical_seconds * 4, 300)
+        self._meta = threading.Lock()      # protects _started_at only (held microseconds)
         self._started_at: float | None = None
+
+    def _is_running(self) -> bool:
+        return self._started_at is not None and (time.time() - self._started_at) < self.max_hold_seconds
 
     @property
     def running(self) -> bool:
-        return self._started_at is not None
+        return self._is_running()
 
     def status(self) -> dict | None:
-        if self._started_at is None:
+        if not self._is_running():
             return None
         elapsed = int(time.time() - self._started_at)
         return {
@@ -64,17 +71,16 @@ class HeavyJob:
         }
 
     def __enter__(self) -> "HeavyJob":
-        if not self._lock.acquire(blocking=False):
-            raise HeavyJobBusy(self.label, self._started_at, self.typical_seconds)
-        self._started_at = time.time()
+        with self._meta:
+            if self._is_running():
+                raise HeavyJobBusy(self.label, self._started_at, self.typical_seconds)
+            # Free, or the previous holder overran (stale/leaked) — claim the slot.
+            self._started_at = time.time()
         return self
 
     def __exit__(self, *exc: object) -> None:
-        self._started_at = None
-        try:
-            self._lock.release()
-        except RuntimeError:
-            pass
+        with self._meta:
+            self._started_at = None
 
 
 # Named, process-wide heavy jobs. Typical durations are rough CPU estimates used

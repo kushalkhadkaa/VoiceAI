@@ -340,6 +340,15 @@ textarea { resize: vertical; min-height: 80px; line-height: 1.5; }
 }
 .play-btn:hover:not(:disabled) { color: var(--teal); background: var(--teal-soft); }
 .play-btn.playing { color: var(--teal); }
+.play-btn.speaking {
+  color: var(--teal); border-color: rgba(0,166,81,0.45);
+  background: var(--teal-soft); cursor: progress;
+  animation: speak-pulse 1.1s ease-in-out infinite;
+}
+@keyframes speak-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0,166,81,0.35); }
+  50% { box-shadow: 0 0 0 5px rgba(0,166,81,0); }
+}
 
 /* Small ghost action button in message footer (copy, etc.) */
 .msg-action {
