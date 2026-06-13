@@ -377,6 +377,16 @@ export async function speakText(text: string, voiceId?: string): Promise<{ ok: b
   return response.json();
 }
 
+export async function getSystemPulse(): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 6000);
+  try {
+    const r = await fetch(`${API_HTTP}/system/pulse`, { signal: ctrl.signal });
+    if (!r.ok) throw new Error(`pulse ${r.status}`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
 export async function getCloningEngines(): Promise<Record<string, any>> {
   const response = await fetch(`${API_HTTP}/voices/cloning-engines`);
   if (!response.ok) {

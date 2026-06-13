@@ -71,6 +71,7 @@ import {
   cloneVoice,
   getVoicesPrompts,
   getCloningEngines,
+  getSystemPulse,
   speakText,
   getAuditLogs,
   getRagStatus,
@@ -306,6 +307,8 @@ const TypingText: React.FC<TypingTextProps> = ({ text, speedMs = 12 }) => {
 
 function App() {
   const [activeView, setActiveView] = useState<ViewId>("conversation");
+  const [pulse, setPulse] = useState<any>(null);
+  const [backendOnline, setBackendOnline] = useState(true);
   const [status, setStatus] = useState<AssistantStatus>("idle");
   const [autoVad, setAutoVad] = useLocalStorage("swarlocal.autoVad", true);
   const [history, setHistory] = useState<ConversationTurn[]>([]);
@@ -549,6 +552,31 @@ function App() {
     if (activeView !== "conversation") return;
     getVoices().then((v) => { if (v) setVoices(v); }).catch(() => {});
   }, [activeView]);
+
+  // Heartbeat / pulse: poll system health every 10s. When the backend comes back
+  // after being down/busy, automatically reload everything so RAG and the rest
+  // recover on their own — no manual Retry needed.
+  useEffect(() => {
+    let stopped = false;
+    let wasOnline = true;
+    const tick = async () => {
+      try {
+        const p = await getSystemPulse();
+        if (stopped) return;
+        setPulse(p);
+        setBackendOnline(true);
+        if (!wasOnline) { void refreshStatus(); }  // recovered → reload data
+        wasOnline = true;
+      } catch {
+        if (stopped) return;
+        setBackendOnline(false);
+        wasOnline = false;
+      }
+    };
+    void tick();
+    const id = window.setInterval(tick, 10000);
+    return () => { stopped = true; clearInterval(id); };
+  }, [refreshStatus]);
 
   const handleTurn = useCallback(
     async (turn: ConversationTurn) => {
@@ -1493,6 +1521,7 @@ function App() {
             );
           })}
         </nav>
+        <SystemPulse pulse={pulse} online={backendOnline} />
         <div className="sidebar-status">
           <StatusDot status={status} />
           <span>{statusLabels[status]}</span>
@@ -2408,6 +2437,14 @@ function KnowledgeView({
 
   useEffect(() => { void refresh(); }, []);
 
+  // Self-heal: while the RAG service looks offline, keep retrying every 8s so it
+  // reconnects on its own once the backend is back — no manual Retry needed.
+  useEffect(() => {
+    if (!serviceDown) return;
+    const id = window.setInterval(() => { void refresh(); }, 8000);
+    return () => clearInterval(id);
+  }, [serviceDown]);
+
   const openCollection = async (col: KBCollection) => {
     setSelectedCol(col);
     setSelectedDocId(null);
@@ -2729,7 +2766,21 @@ function KnowledgeView({
         </div>
 
         <div className="rag-col-list">
-          {collections.length === 0 && (
+          {collections.length === 0 && serviceDown && (
+            <div className="rag-offline-card">
+              <RefreshCw size={22} className="spin" style={{ color: "var(--amber, #f59e0b)", marginBottom: 8 }} />
+              <div className="rag-offline-title">Reconnecting to the knowledge service…</div>
+              <div className="rag-offline-body">
+                Your documents are <b>not lost</b> — the backend just stopped responding for a moment
+                (usually after a heavy voice job, low memory/disk, or a restart). This panel
+                reconnects automatically as soon as it's back.
+              </div>
+              <button className="rag-toolbar-btn" onClick={() => void refresh()} style={{ marginTop: 10 }}>
+                <RefreshCw size={12} /> Retry now
+              </button>
+            </div>
+          )}
+          {collections.length === 0 && !serviceDown && (
             <div style={{ padding: "20px 8px", textAlign: "center", color: "var(--muted)", fontSize: 12 }}>
               <Database size={28} style={{ opacity: 0.3, marginBottom: 8 }} />
               <div>No knowledge bases yet.</div>
@@ -4652,6 +4703,61 @@ const OPENAI_EVAL_MODELS: { value: string; label: string }[] = [
   { value: "openai:gpt-5.5-mini", label: "OpenAI · gpt-5.5-mini" },
   { value: "openai:gpt-5.5-nano", label: "OpenAI · gpt-5.5-nano" },
 ];
+
+function formatUptime(s: number): string {
+  if (s == null || s < 0) return "—";
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${String(sec).padStart(2, "0")}s`;
+  return `${sec}s`;
+}
+
+// Live system heartbeat in the sidebar: status dot, uptime, and click-to-expand
+// health checks + plain-language problems (what / why / how to fix).
+function SystemPulse({ pulse, online }: { pulse: any; online: boolean }) {
+  const [open, setOpen] = useState(false);
+  const status: string = !online ? "down" : (pulse?.status ?? "healthy");
+  const tone = status === "healthy" ? "ok" : status === "degraded" ? "warn" : "bad";
+  const label = !online ? "Backend offline"
+    : status === "healthy" ? "All systems healthy"
+    : status === "degraded" ? "Running — check issues"
+    : "System problem";
+  const problems: any[] = online ? (pulse?.problems ?? []) : [{
+    what: "Backend is not responding",
+    why: "The local backend (port 8001) is down or restarting — usually after running out of memory/disk, a heavy job, or a manual stop.",
+    fix: "It reconnects automatically when it's back. If it stays offline, restart it: cd backend && python3 -m uvicorn app.main:app --port 8001",
+  }];
+  const checks: any[] = online ? (pulse?.checks ?? []) : [];
+  return (
+    <div className={`pulse pulse-${tone}`}>
+      <button className="pulse-head" type="button" onClick={() => setOpen(o => !o)} title="System health — click for details">
+        <span className="pulse-dot" />
+        <span className="pulse-label">{label}</span>
+        {problems.length > 0 && <span className="pulse-badge">{problems.length}</span>}
+        <ChevronRight size={13} className={`pulse-caret ${open ? "open" : ""}`} />
+      </button>
+      <div className="pulse-uptime">{online && pulse ? `Uptime ${formatUptime(pulse.uptime_seconds)}` : "Reconnecting…"}</div>
+      {open && (
+        <div className="pulse-details">
+          {checks.map((c) => (
+            <div key={c.key} className={`pulse-check sev-${c.severity || (c.ok ? "ok" : "bad")}`}>
+              <span className="pulse-check-dot" />
+              <b>{c.label}</b><span>{c.detail}</span>
+            </div>
+          ))}
+          {problems.map((p, i) => (
+            <div key={i} className="pulse-problem">
+              <div className="pp-what"><AlertTriangle size={12} /> {p.what}</div>
+              <div className="pp-why">{p.why}</div>
+              <div className="pp-fix"><Check size={12} /> {p.fix}</div>
+            </div>
+          ))}
+          {online && problems.length === 0 && <div className="pulse-allgood"><CheckCircle2 size={13} /> No problems detected.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
 
 // Unified, friendly progress stepper for the Create Voice flow.
 const WIZARD_STEPS = ["Details", "Consent", "Record", "Publish"];

@@ -259,6 +259,85 @@ def system_busy():
     return {"busy": bool(jobs), "running": jobs}
 
 
+import time as _time
+_BACKEND_STARTED = _time.time()
+
+
+@app.get("/system/pulse")
+def system_pulse():
+    """Fast heartbeat for the UI: uptime + lightweight health checks + any active
+    problems with plain-language what/why/how-to-fix. Uses only fast, local checks
+    (no network calls) so it stays responsive even when the machine is busy."""
+    import datetime
+    checks: list[dict] = [{"key": "backend", "label": "Backend API", "ok": True,
+                           "detail": "Responding", "severity": "ok"}]
+    problems: list[dict] = []
+
+    # Knowledge base (in-memory metadata — fast)
+    try:
+        cols = kb_service.list_collections()
+        docs = sum(getattr(c, "document_count", 0) for c in cols)
+        chunks = sum(getattr(c, "chunk_count", 0) for c in cols)
+        rag_ok = len(cols) > 0
+        checks.append({"key": "rag", "label": "Knowledge base", "ok": rag_ok,
+                       "detail": f"{len(cols)} collection(s) · {docs} docs · {chunks} chunks" if rag_ok
+                                 else "No knowledge bases yet — create one and add documents.",
+                       "severity": "ok" if rag_ok else "info"})
+    except Exception as exc:
+        checks.append({"key": "rag", "label": "Knowledge base", "ok": False,
+                       "detail": f"Could not read knowledge bases: {exc}", "severity": "error"})
+        problems.append({"what": "Knowledge base unreadable",
+                         "why": "The RAG metadata store could not be opened.",
+                         "fix": "Restart the backend; if it persists, check .local/swarlocal.db."})
+
+    # Heavy jobs in progress
+    jobs = _running_jobs()
+    if jobs:
+        j = jobs[0]
+        checks.append({"key": "busy", "label": "Heavy job running", "ok": True,
+                       "detail": f"{j['label']} — ~{j['remaining_seconds']}s left", "severity": "warn"})
+
+    # Disk + memory (fast, local)
+    try:
+        total, _used, free = shutil.disk_usage("/")
+        free_gb = round(free / (1024 ** 3), 1)
+        disk_ok = free_gb >= 8
+        checks.append({"key": "disk", "label": "Disk space", "ok": disk_ok,
+                       "detail": f"{free_gb} GB free", "severity": "ok" if disk_ok else "warn"})
+        if not disk_ok:
+            problems.append({"what": f"Low disk space ({free_gb} GB free)",
+                             "why": "Cloned-voice models (~6 GB) and audio cache need room; low disk can crash synthesis and the backend.",
+                             "fix": "Free up disk to 15 GB+ (empty Trash, clear ~/.cache/huggingface of unused models)."})
+    except Exception:
+        pass
+    try:
+        m = system_monitor_service.get_realtime_metrics()
+        ram_free = m.get("ram_available_gb")
+        if ram_free is not None:
+            ram_ok = ram_free >= 1.5
+            checks.append({"key": "memory", "label": "Free memory", "ok": ram_ok,
+                           "detail": f"{ram_free} GB free", "severity": "ok" if ram_ok else "warn"})
+            if not ram_ok:
+                problems.append({"what": f"Low free memory ({ram_free} GB)",
+                                 "why": "Running a local model + cloned-voice synthesis together can exhaust RAM and the OS kills the backend.",
+                                 "fix": "Close other apps, or use OpenAI (cloud) voice/brain instead of local ones."})
+    except Exception:
+        pass
+
+    uptime = int(_time.time() - _BACKEND_STARTED)
+    status = "down" if any(not c["ok"] and c.get("severity") == "error" for c in checks) else \
+             ("degraded" if problems else "healthy")
+    return {
+        "ok": True,
+        "status": status,
+        "uptime_seconds": uptime,
+        "started_at": datetime.datetime.fromtimestamp(_BACKEND_STARTED).isoformat(),
+        "now": datetime.datetime.now().isoformat(),
+        "checks": checks,
+        "problems": problems,
+    }
+
+
 @app.exception_handler(ProviderUnavailableError)
 async def provider_unavailable_handler(_, exc: ProviderUnavailableError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
