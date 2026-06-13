@@ -1089,6 +1089,25 @@ def chat_test(payload: ChatTestRequest):
     )
 
 
+@app.post("/turn/speak")
+def turn_speak(payload: dict):
+    """On-demand TTS for a text answer (so chat text turns return instantly and
+    audio is only synthesized when the user presses Play)."""
+    from fastapi import HTTPException
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required.")
+    voice_id = (payload.get("voice_id") or "").strip() or None
+    parts = [TTSPart(text=chunk, language=lang) for chunk, lang in language_router.split_for_tts(text)]
+    try:
+        fallback_allowed = not getattr(settings, "force_selected_voice", False) and getattr(settings, "fallback_allowed", True)
+        result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
+    return {"ok": True, "audio_url": f"/audio/{result.audio_path.name}",
+            "actual_voice_name": result.actual_voice_name, "engine": result.actual_tts_engine}
+
+
 # ── RAG Evaluation: generate questions from a document, answer with one model,
 #    verify the answers with a second model ──────────────────────────────────
 def _extract_json(text: str) -> dict:
@@ -1727,6 +1746,7 @@ async def voice_socket(websocket: WebSocket):
                             llm_provider_id=session_llm_provider_id,
                             session_id=socket_status.get("session_id"),
                             stt_provider_id=session_stt_provider_id,
+                            synthesize=False,  # text returns instantly; audio is on-demand via /turn/speak
                         ),
                     )
                 elif message_type == "audio":

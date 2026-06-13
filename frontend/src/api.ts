@@ -368,6 +368,15 @@ export async function getVoicesPrompts(): Promise<any[]> {
   return response.json();
 }
 
+export async function speakText(text: string, voiceId?: string): Promise<{ ok: boolean; audio_url?: string; actual_voice_name?: string; engine?: string }> {
+  const response = await fetch(`${API_HTTP}/turn/speak`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ text, voice_id: voiceId || undefined }),
+  });
+  if (!response.ok) { const d = await response.json().catch(() => null); throw new Error(d?.detail ?? "Speech synthesis failed."); }
+  return response.json();
+}
+
 export async function getCloningEngines(): Promise<Record<string, any>> {
   const response = await fetch(`${API_HTTP}/voices/cloning-engines`);
   if (!response.ok) {

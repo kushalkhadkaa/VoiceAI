@@ -71,6 +71,7 @@ import {
   cloneVoice,
   getVoicesPrompts,
   getCloningEngines,
+  speakText,
   getAuditLogs,
   getRagStatus,
   getSystemInfo,
@@ -392,6 +393,27 @@ function App() {
       setPlayingAudioUrl(null);
     });
   }, [playingAudioUrl]);
+
+  // On-demand TTS: text turns return instantly with no audio; synthesize only
+  // when the user presses Play, then cache the result on the turn.
+  const [speakingTurnId, setSpeakingTurnId] = useState<string | null>(null);
+  const handleSpeakTurn = useCallback(async (turn: ConversationTurn) => {
+    if (turn.audio_url) { handlePlayTurnAudio(turn.audio_url); return; }
+    if (!turn.response) return;
+    const turnId = (turn as any).id;
+    try {
+      setSpeakingTurnId(turnId ?? turn.response);
+      const res = await speakText(turn.response, selectedVoiceId === "auto" ? undefined : selectedVoiceId);
+      if (res.audio_url) {
+        setHistory((items) => items.map((t: any) => ((t.id ?? t.response) === (turnId ?? turn.response) ? { ...t, audio_url: res.audio_url } : t)));
+        handlePlayTurnAudio(res.audio_url);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not synthesize speech.");
+    } finally {
+      setSpeakingTurnId(null);
+    }
+  }, [selectedVoiceId, handlePlayTurnAudio]);
 
   const socketRef = useRef<WebSocket | null>(null);
   const heartbeatRef = useRef<number | null>(null);
@@ -1375,6 +1397,8 @@ function App() {
             onToggleSettings={() => setShowSettings((v) => !v)}
             playingAudioUrl={playingAudioUrl}
             onPlayAudio={handlePlayTurnAudio}
+            onSpeakTurn={handleSpeakTurn}
+            speakingTurnId={speakingTurnId}
             onSaveSettings={saveSettings}
             sttLanguage={sttLanguage}
             onSelectSttLanguage={setSttLanguage}
@@ -1687,6 +1711,8 @@ function ConversationView({
   onToggleSettings,
   playingAudioUrl,
   onPlayAudio,
+  onSpeakTurn,
+  speakingTurnId,
   onSaveSettings,
   sttLanguage,
   onSelectSttLanguage,
@@ -1731,6 +1757,8 @@ function ConversationView({
   onToggleSettings: () => void;
   playingAudioUrl: string | null;
   onPlayAudio: (url: string | null | undefined) => void;
+  onSpeakTurn: (turn: ConversationTurn) => void;
+  speakingTurnId: string | null;
   onSaveSettings: (next: BackendSettings) => void;
   sttLanguage: "auto" | "ne" | "en";
   onSelectSttLanguage: (value: "auto" | "ne" | "en") => void;
@@ -2083,13 +2111,17 @@ function ConversationView({
                               onClick={() => { try { navigator.clipboard?.writeText(turn.response); } catch { /* ignore */ } }}>
                               <Copy size={12} />
                             </button>
-                            {turn.audio_url && (
-                              <button className={`play-btn ${playingAudioUrl === absoluteAudioUrl(turn.audio_url) ? "playing" : ""}`} type="button"
-                                onClick={() => onPlayAudio(turn.audio_url)} title="Play audio response">
-                                {playingAudioUrl === absoluteAudioUrl(turn.audio_url) ? <Square size={12} /> : <Play size={12} />}
-                                <span style={{ fontSize: 11, marginLeft: 3 }}>{playingAudioUrl === absoluteAudioUrl(turn.audio_url) ? "Stop" : "Play"}</span>
-                              </button>
-                            )}
+                            {turn.response && !turn.is_pending && (() => {
+                              const isSpeaking = speakingTurnId === ((turn as any).id ?? turn.response);
+                              const isPlaying = !!turn.audio_url && playingAudioUrl === absoluteAudioUrl(turn.audio_url);
+                              return (
+                                <button className={`play-btn ${isPlaying ? "playing" : ""}`} type="button" disabled={isSpeaking}
+                                  onClick={() => onSpeakTurn(turn)} title={turn.audio_url ? "Play audio response" : "Speak this answer"}>
+                                  {isSpeaking ? <RefreshCw size={12} className="spin" /> : isPlaying ? <Square size={12} /> : <Play size={12} />}
+                                  <span style={{ fontSize: 11, marginLeft: 3 }}>{isSpeaking ? "…" : isPlaying ? "Stop" : "Play"}</span>
+                                </button>
+                              );
+                            })()}
                           </div>
                         </div>
                       </div>
