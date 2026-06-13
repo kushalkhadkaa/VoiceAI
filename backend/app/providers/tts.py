@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from app.services.heavy_jobs import HeavyJobBusy
+
 from app.providers.stt import ProviderUnavailableError
 from app.schemas import LanguageCode
 
@@ -643,14 +645,6 @@ class ElevenLabsTTSProvider:
         return h.hexdigest()[:32]
 
 
-# Chatterbox runs heavy CPU inference (~minutes/clip on CPU). Serialize it across
-# the whole process so concurrent requests (e.g. "speak answers" in eval, or rapid
-# Play clicks) can't pile up, saturate every core/all RAM, and starve the API —
-# which is what made the RAG/KB endpoints time out ("Knowledge service unavailable").
-import threading as _threading
-_CHATTERBOX_SYNTH_LOCK = _threading.Lock()
-
-
 class ChatterboxTTSProvider:
     def __init__(
         self,
@@ -702,10 +696,12 @@ class ChatterboxTTSProvider:
                 generated_audio_path=str(output_path),
             )
 
-        # Serialize the actual generation: one cloned-voice synthesis at a time,
-        # process-wide. Others wait their turn instead of all hammering the CPU.
+        # One cloned-voice synthesis at a time, process-wide. If another is already
+        # running, this raises HeavyJobBusy immediately (caller gets a clear "wait ~Ns"
+        # message) instead of piling up and crashing the backend.
+        from app.services.heavy_jobs import CLONED_VOICE
         segment_paths: list[Path] = []
-        with _CHATTERBOX_SYNTH_LOCK:
+        with CLONED_VOICE:
             for index, part in enumerate(normalized):
                 segment_path = self.audio_cache_dir / f"{cache_key}.{index}.wav"
                 self._generate_segment(part, reference_path, segment_path)
@@ -935,6 +931,10 @@ class TTSRouter:
                 if self.chatterbox_provider is None:
                     raise ValueError("Chatterbox provider is not configured.")
                 return self.chatterbox_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
+            except HeavyJobBusy:
+                # Don't silently swap to another voice — let the caller tell the
+                # user "a cloned voice is already running, please wait".
+                raise
             except Exception as exc:
                 if not fallback_allowed:
                     raise

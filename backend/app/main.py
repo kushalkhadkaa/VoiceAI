@@ -240,6 +240,25 @@ app.mount("/audio/voices", StaticFiles(directory=str(voices_dir)), name="voices-
 app.mount("/audio", StaticFiles(directory=str(settings.piper_audio_cache_dir)), name="audio")
 
 
+# When a heavy job (cloned-voice synthesis, voice build) is already running, any
+# new request to start another is rejected with HTTP 429 and a clear, friendly
+# message — handled in one place so it applies to every endpoint.
+from app.services.heavy_jobs import HeavyJobBusy as _HeavyJobBusy, running_jobs as _running_jobs
+
+
+@app.exception_handler(_HeavyJobBusy)
+async def _heavy_job_busy_handler(_request, exc: _HeavyJobBusy):
+    return JSONResponse(status_code=429, content={"detail": exc.message},
+                        headers={"Retry-After": str(exc.retry_after)})
+
+
+@app.get("/system/busy")
+def system_busy():
+    """What heavy job (if any) is running right now, so the UI can show it."""
+    jobs = _running_jobs()
+    return {"busy": bool(jobs), "running": jobs}
+
+
 @app.exception_handler(ProviderUnavailableError)
 async def provider_unavailable_handler(_, exc: ProviderUnavailableError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
@@ -1102,6 +1121,8 @@ def turn_speak(payload: dict):
     try:
         fallback_allowed = not getattr(settings, "force_selected_voice", False) and getattr(settings, "fallback_allowed", True)
         result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=fallback_allowed)
+    except _HeavyJobBusy:
+        raise  # surfaced as a friendly 429 by the global handler
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
     return {"ok": True, "audio_url": f"/audio/{result.audio_path.name}",
@@ -2034,7 +2055,10 @@ def clone_voice(voice_id: str):
     import uuid
     import time
     from fastapi import HTTPException
-    
+    from app.services.heavy_jobs import VOICE_BUILD
+
+    # Reject a second build immediately (HTTP 429) if one is already running.
+    VOICE_BUILD.__enter__()
     conn = get_db_connection()
     try:
         voice = conn.execute("SELECT * FROM voices WHERE id = ?;", (voice_id,)).fetchone()
@@ -2195,7 +2219,8 @@ def clone_voice(voice_id: str):
         raise HTTPException(status_code=500, detail=f"Cloning failed: {exc}")
     finally:
         conn.close()
-        
+        VOICE_BUILD.__exit__()
+
     return {"ok": True, "job_id": job_id, "status": "completed"}
 
 @app.post("/voices/{voice_id}/preview")
@@ -2218,6 +2243,8 @@ async def preview_cloned_voice(voice_id: str):
     parts = [TTSPart(text=chunk, language=lang) for chunk, lang in language_router.split_for_tts(test_text)]
     try:
         result = tts_provider.synthesize(parts, voice_id=voice_id, fallback_allowed=False)
+    except _HeavyJobBusy:
+        raise  # friendly 429 via the global handler
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Preview synthesis failed: {exc}")
     return FileResponse(str(result.audio_path), media_type="audio/wav", filename="preview.wav")
