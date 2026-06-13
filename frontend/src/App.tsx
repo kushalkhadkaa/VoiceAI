@@ -7,6 +7,7 @@ import {
   Mic,
   Play,
   Radio,
+  MicOff,
   Save,
   Send,
   Settings,
@@ -69,6 +70,7 @@ import {
   cleanRecording,
   cloneVoice,
   getVoicesPrompts,
+  getCloningEngines,
   getAuditLogs,
   getRagStatus,
   getSystemInfo,
@@ -4224,12 +4226,123 @@ function UseCaseCard({ icon, title, body, example }: { icon: React.ReactNode; ti
   );
 }
 
+// Friendly names + install hints for the cloning engines (keyed by engine id).
+const ENGINE_LABELS: Record<string, string> = {
+  chatterbox: "Chatterbox local clone",
+  piper: "Piper fine-tune",
+  elevenlabs: "ElevenLabs (cloud)",
+  f5_tts: "F5-TTS",
+  openvoice: "OpenVoice",
+  voxcpm: "VoxCPM",
+};
+const ENGINE_INSTALL_HINT: Record<string, string> = {
+  chatterbox: "pip install chatterbox-tts",
+  f5_tts: "pip install f5-tts",
+  openvoice: "pip install openvoice",
+  voxcpm: "pip install voxcpm",
+};
+function fmtDuration(totalSeconds: number): string {
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// Unified, friendly progress stepper for the Create Voice flow.
+const WIZARD_STEPS = ["Details", "Consent", "Record", "Publish"];
+function WizardStepper({ current }: { current: number }) {
+  return (
+    <div className="wizard-progress" role="list" aria-label="Voice creation progress">
+      {WIZARD_STEPS.map((label, i) => {
+        const step = i + 1;
+        const state = step < current ? "done" : step === current ? "active" : "upcoming";
+        return (
+          <div
+            className={`wizard-step ${state}`}
+            role="listitem"
+            aria-current={state === "active" ? "step" : undefined}
+            key={label}
+          >
+            <span className="wizard-step-badge">{state === "done" ? <Check size={14} /> : step}</span>
+            <span className="wizard-step-label">{label}</span>
+            {i < WIZARD_STEPS.length - 1 && <span className="wizard-step-line" aria-hidden="true" />}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 const STUDIO_HOWTO = [
   { n: 1, icon: "🎤", title: "Record", desc: "Read a few short sentences aloud in your normal voice." },
   { n: 2, icon: "✨", title: "Build", desc: "The studio cleans your audio and builds an AI voice from it." },
   { n: 3, icon: "🔊", title: "Listen", desc: "Preview a sample to check it sounds like you." },
   { n: 4, icon: "🚀", title: "Publish", desc: "Activate the voice so the assistant can speak with it." },
 ];
+
+// Pre-flight readiness — surfaces mic + engine problems BEFORE the user records,
+// so nobody records a dozen takes only to hit an error at build time.
+function RecordingPreflight({
+  micState,
+  engineId,
+  engineInfo,
+}: {
+  micState: "unknown" | "granted" | "denied" | "unavailable";
+  engineId: string;
+  engineInfo: any | null;
+}) {
+  const engineLabel = ENGINE_LABELS[engineId] ?? engineId;
+  const isCloud = engineId === "elevenlabs";
+  // engineInfo === null → status not loaded yet; don't alarm the user.
+  const engineMissing = engineInfo ? engineInfo.installed === false : false;
+
+  const checks: { key: string; state: "ok" | "warn" | "bad" | "idle"; icon: React.ReactNode; label: string; detail: React.ReactNode }[] = [
+    {
+      key: "mic",
+      state: micState === "granted" ? "ok" : micState === "denied" || micState === "unavailable" ? "bad" : "idle",
+      icon: micState === "denied" || micState === "unavailable" ? <MicOff size={16} /> : <Mic size={16} />,
+      label: "Microphone",
+      detail:
+        micState === "granted" ? "Ready — access granted."
+        : micState === "denied" ? "Blocked. Click the 🔒/mic icon in your browser's address bar and allow the microphone, then reload."
+        : micState === "unavailable" ? "No microphone detected, or your browser blocks recording on this page."
+        : "We'll ask for access the first time you hit record — that's normal.",
+    },
+    {
+      key: "engine",
+      state: engineMissing ? "bad" : engineInfo ? "ok" : "idle",
+      icon: engineMissing ? <AlertTriangle size={16} /> : <Cpu size={16} />,
+      label: `Voice engine — ${engineLabel}`,
+      detail: engineMissing ? (
+        <>
+          Not installed yet, so <b>building the voice will fail</b> after you record. Install it first:{" "}
+          {ENGINE_INSTALL_HINT[engineId] ? <code>{ENGINE_INSTALL_HINT[engineId]}</code> : "see the project README"}.
+          {" "}You can still record now and build once it's installed.
+        </>
+      ) : isCloud ? "Cloud engine — make sure your API key is set in Settings before building."
+        : engineInfo ? "Installed and ready to build your voice."
+        : "Checking engine availability…",
+    },
+  ];
+
+  const hasBlocker = checks.some((c) => c.state === "bad");
+  return (
+    <div className={`preflight ${hasBlocker ? "has-issue" : "ready"}`}>
+      <div className="preflight-head">
+        {hasBlocker ? <AlertTriangle size={15} /> : <CheckCircle2 size={15} />}
+        <strong>{hasBlocker ? "Before you record — a couple of things to fix" : "You're set up to record"}</strong>
+      </div>
+      <div className="preflight-rows">
+        {checks.map((c) => (
+          <div className={`preflight-row ${c.state}`} key={c.key}>
+            <span className="preflight-icon">{c.icon}</span>
+            <span className="preflight-label">{c.label}</span>
+            <span className="preflight-detail">{c.detail}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 function VoiceStudioView({
   voices,
@@ -4272,6 +4385,18 @@ function VoiceStudioView({
   const selectedVoiceIdValue = selectedVoice?.id || selectedVoice?.voice_id;
   const selectedVoiceConsentComplete = selectedVoice?.consent_status === "completed";
 
+  // Live recording feedback (waveform + timer) and pre-flight readiness
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const timerRef = useRef<number | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const waveCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [recordElapsed, setRecordElapsed] = useState(0);
+  const [micState, setMicState] = useState<"unknown" | "granted" | "denied" | "unavailable">("unknown");
+  const [engines, setEngines] = useState<Record<string, any> | null>(null);
+  const [studioMsg, setStudioMsg] = useState<{ kind: "ok" | "err" | "busy"; text: string } | null>(null);
+
   // Load prompts & recordings if a custom voice is selected
   useEffect(() => {
     const voiceId = selectedVoice?.id || selectedVoice?.voice_id;
@@ -4280,6 +4405,86 @@ function VoiceStudioView({
       getVoiceRecordings(voiceId).then(setRecordings).catch(() => {});
     }
   }, [selectedVoice]);
+
+  // Pre-flight: when the recording step opens, check engine availability and mic
+  // permission up front so issues surface BEFORE the user records anything.
+  useEffect(() => {
+    if (wizardStep !== "recordings") return;
+    getCloningEngines().then(setEngines).catch(() => setEngines(null));
+    let cancelled = false;
+    let permStatus: any = null;
+    const apply = (state: string) =>
+      !cancelled && setMicState(state === "granted" ? "granted" : state === "denied" ? "denied" : "unknown");
+    (async () => {
+      if (!navigator.mediaDevices?.getUserMedia) { if (!cancelled) setMicState("unavailable"); return; }
+      try {
+        const perms: any = navigator.permissions;
+        if (perms?.query) {
+          permStatus = await perms.query({ name: "microphone" as PermissionName });
+          apply(permStatus.state);
+          permStatus.onchange = () => apply(permStatus.state);
+        }
+      } catch { /* Safari/Firefox may not support the 'microphone' permission query */ }
+    })();
+    return () => { cancelled = true; if (permStatus) permStatus.onchange = null; };
+  }, [wizardStep]);
+
+  // Tear down the live waveform + timer + audio graph after a take.
+  const stopRecordingInternals = () => {
+    if (rafRef.current != null) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    if (timerRef.current != null) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (audioCtxRef.current) { audioCtxRef.current.close().catch(() => {}); audioCtxRef.current = null; }
+    analyserRef.current = null;
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+  };
+
+  // Draw an animated frequency-bar waveform from the live mic analyser.
+  const drawWaveform = () => {
+    const canvas = waveCanvasRef.current;
+    const analyser = analyserRef.current;
+    if (!canvas || !analyser) { rafRef.current = requestAnimationFrame(drawWaveform); return; }
+    const ctx = canvas.getContext("2d");
+    if (!ctx) { rafRef.current = requestAnimationFrame(drawWaveform); return; }
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth || 320;
+    const cssH = canvas.clientHeight || 64;
+    if (canvas.width !== Math.round(cssW * dpr) || canvas.height !== Math.round(cssH * dpr)) {
+      canvas.width = Math.round(cssW * dpr);
+      canvas.height = Math.round(cssH * dpr);
+    }
+    const w = canvas.width, h = canvas.height;
+    const bins = analyser.frequencyBinCount;
+    const data = new Uint8Array(bins);
+    analyser.getByteFrequencyData(data);
+    ctx.clearRect(0, 0, w, h);
+    const bars = 56;
+    const usable = Math.floor(bins * 0.7); // skip the very-high empty bins
+    const barW = w / bars;
+    for (let i = 0; i < bars; i++) {
+      const v = data[Math.floor((i / bars) * usable)] / 255;
+      const bh = Math.max(2 * dpr, v * h * 0.95);
+      const x = i * barW;
+      const grad = ctx.createLinearGradient(0, h, 0, h - bh);
+      grad.addColorStop(0, "rgba(0,166,81,0.45)");
+      grad.addColorStop(1, "#00d36a");
+      ctx.fillStyle = grad;
+      const r = Math.min(barW / 2 - dpr, 3 * dpr);
+      const bx = x + dpr, bw = barW - 2 * dpr, by = h - bh;
+      ctx.beginPath();
+      ctx.moveTo(bx + r, by);
+      ctx.arcTo(bx + bw, by, bx + bw, by + r, r);
+      ctx.lineTo(bx + bw, h);
+      ctx.lineTo(bx, h);
+      ctx.lineTo(bx, by + r);
+      ctx.arcTo(bx, by, bx + r, by, r);
+      ctx.closePath();
+      ctx.fill();
+    }
+    rafRef.current = requestAnimationFrame(drawWaveform);
+  };
+
+  // Tear everything down if the component unmounts mid-recording.
+  useEffect(() => () => stopRecordingInternals(), []);
 
   const [creatingVoice, setCreatingVoice] = useState(false);
 
@@ -4332,39 +4537,83 @@ function VoiceStudioView({
   };
 
   const handleStartRecord = async (promptId: string) => {
+    if (!selectedVoiceIdValue) {
+      setStudioMsg({ kind: "err", text: "Voice profile ID is missing. Go back to the gallery and reopen this voice." });
+      return;
+    }
+    let stream: MediaStream;
     try {
-      if (!selectedVoiceIdValue) {
-        throw new Error("Voice profile ID is missing. Please go back to gallery and try again.");
-      }
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 44100 } });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 44100 } });
+    } catch (err: any) {
+      // Surface the real reason instead of a scary generic alert.
+      const denied = err?.name === "NotAllowedError" || err?.name === "SecurityError";
+      setMicState(denied ? "denied" : "unavailable");
+      setStudioMsg({
+        kind: "err",
+        text: denied
+          ? "Microphone access was blocked. Click the mic / lock icon in your browser's address bar, allow the microphone, then try again."
+          : "No microphone is available. Plug one in (or check your system settings) and try again.",
+      });
+      return;
+    }
+    try {
+      setStudioMsg(null);
+      setMicState("granted");
+      streamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       recorderRef.current = recorder;
       chunksRef.current = [];
       setActivePrompt(promptId);
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
+
+      // Live waveform: tap the mic into an analyser node.
+      try {
+        const AC: typeof AudioContext = (window as any).AudioContext || (window as any).webkitAudioContext;
+        const ctx = new AC();
+        const source = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 256;
+        analyser.smoothingTimeConstant = 0.7;
+        source.connect(analyser);
+        audioCtxRef.current = ctx;
+        analyserRef.current = analyser;
+        rafRef.current = requestAnimationFrame(drawWaveform);
+      } catch { /* waveform is non-essential — recording still works without it */ }
+
+      // Live timer.
+      setRecordElapsed(0);
+      const startedAt = Date.now();
+      timerRef.current = window.setInterval(() => {
+        setRecordElapsed(Math.floor((Date.now() - startedAt) / 1000));
+      }, 250);
+
+      recorder.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
       recorder.onstop = async () => {
+        stopRecordingInternals();
         const blob = new Blob(chunksRef.current, { type: "audio/wav" });
         try {
           await uploadVoiceRecording(selectedVoiceIdValue, promptId, blob);
           const updated = await getVoiceRecordings(selectedVoiceIdValue);
           setRecordings(updated);
         } catch (err: any) {
-          alert(err.message || "Failed to upload recording");
+          setStudioMsg({ kind: "err", text: err.message || "Couldn't save that recording. Please try again." });
         }
         setActivePrompt(null);
+        setRecordElapsed(0);
       };
       recorder.start();
     } catch (err: any) {
-      alert("Microphone permission denied or unavailable");
+      stopRecordingInternals();
+      setActivePrompt(null);
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't start recording. Please try again." });
     }
   };
 
   const handleStopRecord = () => {
     if (recorderRef.current && recorderRef.current.state === "recording") {
-      recorderRef.current.stop();
-      recorderRef.current.stream.getTracks().forEach(track => track.stop());
+      recorderRef.current.stop(); // onstop tears down internals + uploads
+    } else {
+      stopRecordingInternals();
+      setActivePrompt(null);
     }
   };
 
@@ -4377,7 +4626,7 @@ function VoiceStudioView({
       const updated = await getVoiceRecordings(selectedVoiceIdValue);
       setRecordings(updated);
     } catch (err: any) {
-      alert(err.message);
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't delete that recording." });
     }
   };
 
@@ -4387,23 +4636,23 @@ function VoiceStudioView({
       setCleaningAll(true);
       const toClean = recordings.filter(r => r.exists);
       if (toClean.length === 0) {
-        alert("No recordings to clean yet. Record some samples first.");
+        setStudioMsg({ kind: "err", text: "No recordings to clean yet — record a few samples first." });
         return;
       }
+      setStudioMsg({ kind: "busy", text: `Cleaning ${toClean.length} recording${toClean.length > 1 ? "s" : ""} — removing noise, trimming silence, normalizing loudness…` });
       for (const rec of toClean) {
         await cleanRecording(selectedVoiceIdValue, rec.id);
       }
-      alert("All recordings have been cleaned and normalized successfully!");
       const updated = await getVoiceRecordings(selectedVoiceIdValue);
       setRecordings(updated);
+      setStudioMsg({ kind: "ok", text: "All recordings cleaned and normalized. They're ready to build a voice." });
     } catch (err: any) {
-      alert(err.message || "Failed to clean recordings.");
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't clean the recordings. Please try again." });
     } finally {
       setCleaningAll(false);
     }
   };
 
-  const [studioMsg, setStudioMsg] = useState<{ kind: "ok" | "err" | "busy"; text: string } | null>(null);
   const [publishing, setPublishing] = useState(false);
 
   const refreshSelectedVoice = async () => {
@@ -4433,6 +4682,7 @@ function VoiceStudioView({
     if (!selectedVoiceIdValue) return;
     try {
       setPreviewingVoice(true);
+      setStudioMsg({ kind: "busy", text: "Generating a preview… the first run may download the voice model, so give it a moment." });
       // Chatterbox downloads ~1-2GB model on first use — no browser fetch timeout
       const controller = new AbortController();
       const resp = await fetch(`${API_HTTP}/voices/${selectedVoiceIdValue}/preview`, {
@@ -4448,9 +4698,10 @@ function VoiceStudioView({
       const audio = new Audio(url);
       audio.play();
       audio.onended = () => URL.revokeObjectURL(url);
+      setStudioMsg({ kind: "ok", text: "Playing a preview with your cloned voice." });
     } catch (err: any) {
       if (err.name === "AbortError") return;
-      alert(err.message || "Failed to preview cloned voice");
+      setStudioMsg({ kind: "err", text: err.message || "Couldn't generate a preview. Try building the voice again." });
     } finally {
       setPreviewingVoice(false);
     }
@@ -4545,7 +4796,7 @@ function VoiceStudioView({
   }, {});
 
   return (
-    <section className="view-stack">
+    <section className="view-stack voice-studio-view">
       {wizardStep === "gallery" && (
         <>
           <div className="view-header">
@@ -4634,61 +4885,63 @@ function VoiceStudioView({
           <div className="voice-studio-grid">
             {/* Built-in Voices — ready instantly, no recording needed */}
             {showBuiltins && builtinLangOk("ne") && (
-            <article className="status-card voice-studio-card">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <ShieldCheck size={20} color="#48bb78" />
+            <article className="voice-studio-card">
+              <div className="voice-card-header">
+                <ShieldCheck size={20} style={{ color: "var(--green)" }} />
                 <strong>Nepali chitwan</strong>
-                <span className="pill good" style={{ marginLeft: "auto" }}>Ready</span>
+                <span className="pill good">Ready</span>
               </div>
-              <span className="muted">Built-in · rhasspy/piper-voices</span>
-              <span style={{ fontSize: 11.5, color: "var(--muted)", lineHeight: 1.5 }}>
+              <span className="voice-card-desc">
                 A natural Nepali voice you can use right away — no recording or setup required.
               </span>
               <div className="pill-group">
-                <span className="pill good">ne</span>
-                <span className="pill">piper</span>
-                <span className="pill good">commercial OK</span>
+                <span className="pill good">Nepali</span>
+                <span className="pill">Piper · built-in</span>
+                <span className="pill good">Commercial OK</span>
               </div>
-              <button className="icon-text" onClick={() => onTtsTest("ne")} type="button"
-                title="Hear a short sample spoken in this Nepali voice.">
-                <Volume2 size={16} />
-                <span>Hear a sample</span>
-              </button>
+              <div className="voice-card-actions">
+                <button className="voice-action-secondary" onClick={() => onTtsTest("ne")} type="button"
+                  title="Hear a short sample spoken in this Nepali voice.">
+                  <Volume2 size={16} />
+                  <span>Hear a sample</span>
+                </button>
+              </div>
             </article>
             )}
 
             {showBuiltins && builtinLangOk("en") && (
-            <article className="status-card voice-studio-card">
-              <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                <ShieldCheck size={20} color="#48bb78" />
+            <article className="voice-studio-card">
+              <div className="voice-card-header">
+                <ShieldCheck size={20} style={{ color: "var(--green)" }} />
                 <strong>English lessac</strong>
-                <span className="pill good" style={{ marginLeft: "auto" }}>Ready</span>
+                <span className="pill good">Ready</span>
               </div>
-              <span className="muted">Built-in · rhasspy/piper-voices</span>
-              <span style={{ fontSize: 11.5, color: "var(--muted)", lineHeight: 1.5 }}>
+              <span className="voice-card-desc">
                 A clear English voice ready to use instantly — perfect for a quick start.
               </span>
               <div className="pill-group">
-                <span className="pill good">en</span>
-                <span className="pill">piper</span>
-                <span className="pill good">commercial OK</span>
+                <span className="pill good">English</span>
+                <span className="pill">Piper · built-in</span>
+                <span className="pill good">Commercial OK</span>
               </div>
-              <button className="icon-text" onClick={() => onTtsTest("en")} type="button"
-                title="Hear a short sample spoken in this English voice.">
-                <Volume2 size={16} />
-                <span>Hear a sample</span>
-              </button>
+              <div className="voice-card-actions">
+                <button className="voice-action-secondary" onClick={() => onTtsTest("en")} type="button"
+                  title="Hear a short sample spoken in this English voice.">
+                  <Volume2 size={16} />
+                  <span>Hear a sample</span>
+                </button>
+              </div>
             </article>
             )}
 
             {/* Custom Profiles */}
             {filteredGallery.map(cv => (
-              <article key={cv.id} className="status-card voice-studio-card">
-                <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
-                  <User size={20} color="#4299e1" />
+              <article key={cv.id} className="voice-studio-card">
+                <div className="voice-card-header">
+                  <User size={20} style={{ color: "var(--blue)" }} />
                   <strong>{cv.name}</strong>
                 </div>
-                <span className="muted">Owner: {cv.owner_name} ({cv.owner_org || "Personal"})</span>
+                <span className="voice-card-desc">Owner: {cv.owner_name} ({cv.owner_org || "Personal"})</span>
                 <div className="pill-group">
                   <span className="pill good">{cv.language}</span>
                   <span className="pill">{cv.engine}</span>
@@ -4696,27 +4949,26 @@ function VoiceStudioView({
                     Consent: {cv.consent_status}
                   </span>
                   <span className={`pill ${cv.publish_status === 'published' ? 'good' : 'warn'}`}>
-                    {cv.publish_status === 'published' ? 'Ready to Use' : 'Needs More Samples'}
+                    {cv.publish_status === 'published' ? 'Ready to use' : 'Needs more samples'}
                   </span>
-                  <span className="pill">Voice Match pending</span>
                   <span className="pill">Quality {Math.round(cv.quality_score ?? 0)}</span>
                 </div>
-                <div style={{ display: 'flex', gap: '0.5rem', width: '100%', marginTop: 'auto', paddingTop: '0.5rem' }}>
-                  <button className="icon-text" onClick={() => onTtsTest(cv.language === "en" ? "en" : "ne", cv.id)} type="button">
+                <div className="voice-card-actions">
+                  <button className="voice-action-secondary" onClick={() => onTtsTest(cv.language === "en" ? "en" : "ne", cv.id)} type="button">
                     <Volume2 size={16} />
                     <span>Test</span>
                   </button>
                   {cv.publish_status !== 'published' ? (
-                    <button className="icon-text" onClick={() => { setSelectedVoice(cv); setWizardStep(cv.consent_status === "completed" ? "recordings" : "consent"); }} type="button">
+                    <button className="voice-action-primary" onClick={() => { setSelectedVoice(cv); setWizardStep(cv.consent_status === "completed" ? "recordings" : "consent"); }} type="button">
                       <Mic size={16} />
-                      <span>{cv.consent_status === "completed" ? "Continue setup" : "Add consent"}</span>
+                      <span>{cv.consent_status === "completed" ? "Continue" : "Add consent"}</span>
                     </button>
                   ) : (
-                    <span className="pill good" style={{ display: 'inline-flex', alignItems: 'center', gap: '0.25rem' }}>
+                    <span className="pill good voice-action-ready">
                       <Check size={14} /> Ready
                     </span>
                   )}
-                  <button className="icon-text danger" onClick={() => handleDeleteVoiceProfile(cv.id)} style={{ marginLeft: 'auto', padding: '0.25rem 0.5rem' }} type="button">
+                  <button className="voice-action-danger" onClick={() => handleDeleteVoiceProfile(cv.id)} type="button" title="Delete this voice profile">
                     <Trash2 size={16} />
                   </button>
                 </div>
@@ -4753,53 +5005,49 @@ function VoiceStudioView({
           </div>
 
           {/* Quick TTS Voices — no training needed */}
-          <div style={{ marginTop: 20 }}>
-            <div style={{ fontSize: 11, color: "var(--muted)", textTransform: "uppercase", letterSpacing: 0.6, fontWeight: 700, marginBottom: 12 }}>
-              Cloud TTS Voices · OpenAI (instant, no training)
-            </div>
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(160px, 1fr))", gap: 10 }}>
-              {[
-                { id: "openai-alloy", label: "Alloy", desc: "Neutral, balanced" },
-                { id: "openai-echo", label: "Echo", desc: "Clear & steady" },
-                { id: "openai-fable", label: "Fable", desc: "Warm, storytelling" },
-                { id: "openai-onyx", label: "Onyx", desc: "Deep, authoritative" },
-                { id: "openai-nova", label: "Nova", desc: "Bright & upbeat" },
-                { id: "openai-shimmer", label: "Shimmer", desc: "Gentle, soothing" },
-              ].map(v => (
-                <div key={v.id} style={{ padding: "12px 14px", borderRadius: 10, border: "1px solid var(--line)", background: "var(--panel)", display: "flex", flexDirection: "column", gap: 6 }}>
-                  <div style={{ fontWeight: 700, fontSize: 13 }}>{v.label}</div>
-                  <div style={{ fontSize: 11, color: "var(--muted)" }}>{v.desc}</div>
-                  <button className="icon-text" style={{ marginTop: 4, padding: "4px 10px", fontSize: 12 }}
-                    onClick={() => onTtsTest("en", v.id)} type="button">
-                    <Volume2 size={13} /><span>Preview</span>
-                  </button>
-                </div>
-              ))}
-            </div>
+          <div className="studio-section-label"><Sparkles size={13} /> Cloud TTS Voices · OpenAI — instant, no training</div>
+          <div className="voice-tts-grid">
+            {[
+              { id: "openai-alloy", label: "Alloy", desc: "Neutral, balanced" },
+              { id: "openai-echo", label: "Echo", desc: "Clear & steady" },
+              { id: "openai-fable", label: "Fable", desc: "Warm, storytelling" },
+              { id: "openai-onyx", label: "Onyx", desc: "Deep, authoritative" },
+              { id: "openai-nova", label: "Nova", desc: "Bright & upbeat" },
+              { id: "openai-shimmer", label: "Shimmer", desc: "Gentle, soothing" },
+            ].map(v => (
+              <div key={v.id} className="voice-tts-card">
+                <strong>{v.label}</strong>
+                <span>{v.desc}</span>
+                <button className="voice-action-secondary" onClick={() => onTtsTest("en", v.id)} type="button">
+                  <Volume2 size={14} /><span>Preview</span>
+                </button>
+              </div>
+            ))}
           </div>
 
           {/* Enhanced Audit Log */}
-          <div style={{ marginTop: 24, borderRadius: 12, border: "1px solid var(--line)", overflow: "hidden" }}>
-            <div style={{ padding: "12px 18px", background: "var(--panel)", borderBottom: "1px solid var(--line)", display: "flex", alignItems: "center", gap: 8 }}>
-              <Activity size={15} style={{ color: "var(--teal)" }} />
-              <strong style={{ fontSize: 13 }}>Consent & Audit Log</strong>
-              <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--muted)" }}>{auditLogs.length} events</span>
+          <div className="audit-log-container">
+            <div className="audit-log-header">
+              <Activity size={15} />
+              <strong>Consent &amp; Audit Log</strong>
+              <span>{auditLogs.length} events</span>
             </div>
             {auditLogs.length === 0 ? (
-              <div style={{ padding: 24, textAlign: "center", color: "var(--muted)", fontSize: 13 }}>No audit events yet</div>
+              <div className="audit-log-empty">No audit events yet</div>
             ) : (
-              <div style={{ maxHeight: 220, overflowY: "auto" }}>
+              <div className="audit-log-list">
                 {[...auditLogs].reverse().map((log, i) => {
                   const isGood = log.event?.includes("publish") || log.event?.includes("consent") || log.event?.includes("clone");
                   const isWarn = log.event?.includes("delete") || log.event?.includes("error");
+                  const tone = isGood ? "good" : isWarn ? "warn" : "info";
                   return (
-                    <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 18px", borderBottom: i < auditLogs.length - 1 ? "1px solid var(--line)" : "none", background: i % 2 === 0 ? "transparent" : "var(--surface-2)" }}>
-                      <div style={{ width: 8, height: 8, borderRadius: "50%", marginTop: 5, flexShrink: 0, background: isGood ? "var(--green)" : isWarn ? "var(--rose)" : "var(--teal)" }} />
-                      <div style={{ flex: 1, minWidth: 0 }}>
-                        <div style={{ fontSize: 12, fontWeight: 600, color: isGood ? "var(--green)" : isWarn ? "var(--rose)" : "var(--ink)" }}>{log.event}</div>
-                        <div style={{ fontSize: 11, color: "var(--muted)", marginTop: 2, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{log.details}</div>
+                    <div key={i} className="audit-log-entry">
+                      <div className={`audit-log-dot ${tone}`} />
+                      <div className="audit-log-body">
+                        <div className={`audit-log-event ${tone}`}>{log.event}</div>
+                        <div className="audit-log-details">{log.details}</div>
                       </div>
-                      <div style={{ fontSize: 10, color: "var(--muted)", flexShrink: 0, fontFamily: "monospace" }}>{log.timestamp?.slice(0, 16)?.replace("T", " ") ?? ""}</div>
+                      <div className="audit-log-timestamp">{log.timestamp?.slice(0, 16)?.replace("T", " ") ?? ""}</div>
                     </div>
                   );
                 })}
@@ -4810,9 +5058,10 @@ function VoiceStudioView({
       )}
 
       {wizardStep === "identity" && (
-        <form onSubmit={handleCreateVoice} className="status-card voice-wizard-form">
-          <div className="wizard-progress"><span className="active">1 Name</span><span>2 Goal</span><span>3 Consent</span><span>4 Record</span><span>5 Publish</span></div>
-          <h3>Create Voice</h3>
+        <form onSubmit={handleCreateVoice} className="voice-wizard-form">
+          <WizardStepper current={1} />
+          <h3>Create a voice</h3>
+          <p className="wizard-subtitle">Name the voice and confirm who it belongs to. This takes about a minute — nothing is recorded yet.</p>
           <GuideCallout tone="info" icon={<Info size={16} />} title="What happens in this step">
             You're just naming the voice and saying who it belongs to — <b>nothing is recorded yet</b>.
             Next you'll read a few sentences aloud, and the studio turns them into a voice for you.
@@ -4888,19 +5137,20 @@ function VoiceStudioView({
             <span>I confirm I have permission to use this person's voice.</span>
           </label>
           <FieldHint>Required by law and ethics — cloning someone's voice without their consent is not allowed.</FieldHint>
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
-            <button type="button" className="icon-text danger" onClick={() => setWizardStep("gallery")}>Cancel</button>
-            <button type="submit" className="icon-text good" style={{ marginLeft: 'auto' }} disabled={creatingVoice}>
-              {creatingVoice ? "Creating…" : "Create & Start Recording →"}
+          <div className="form-action-row">
+            <button type="button" className="icon-text" onClick={() => setWizardStep("gallery")}>Cancel</button>
+            <button type="submit" className="icon-text good" disabled={creatingVoice}>
+              {creatingVoice ? "Creating…" : "Create & start recording →"}
             </button>
           </div>
         </form>
       )}
 
       {wizardStep === "consent" && (
-        <form onSubmit={handleSaveConsent} className="status-card voice-wizard-form">
-          <div className="wizard-progress"><span>1 Name</span><span className="active">2 Consent</span><span>3 Record</span><span>4 Test</span><span>5 Publish</span></div>
+        <form onSubmit={handleSaveConsent} className="voice-wizard-form">
+          <WizardStepper current={2} />
           <h3>Consent &amp; ownership</h3>
+          <p className="wizard-subtitle">A quick signature confirming the owner agreed to have their voice cloned.</p>
           <GuideCallout tone="info" icon={<ShieldCheck size={16} />} title="Why we ask for this">
             A voice is personal — like a fingerprint. This signature is a record that the owner agreed to have
             their voice cloned. It protects both you and them, and it's required before the voice can be built or published.
@@ -4914,9 +5164,9 @@ function VoiceStudioView({
             <input type="text" value={signature} onChange={e => setSignature(e.target.value)} required placeholder="e.g. Kushal Khadka" />
             <FieldHint>Type the full name exactly. This is saved to the audit log with a timestamp as proof of consent.</FieldHint>
           </div>
-          <div style={{ display: 'flex', gap: '1rem', marginTop: '1rem' }}>
-            <button type="button" className="icon-text danger" onClick={() => setWizardStep("gallery")}>Cancel</button>
-            <button type="submit" className="icon-text good" style={{ marginLeft: 'auto' }}>Sign and Continue</button>
+          <div className="form-action-row">
+            <button type="button" className="icon-text" onClick={() => setWizardStep("gallery")}>Cancel</button>
+            <button type="submit" className="icon-text good">Sign and continue →</button>
           </div>
         </form>
       )}
@@ -4935,6 +5185,13 @@ function VoiceStudioView({
             </div>
             <button className="icon-text" onClick={() => { setStudioMsg(null); setWizardStep("gallery"); }} type="button">← Back to Gallery</button>
           </div>
+
+          {/* Pre-flight: catch mic / engine issues BEFORE recording, not after */}
+          <RecordingPreflight
+            micState={micState}
+            engineId={selectedVoice?.engine || "chatterbox"}
+            engineInfo={engines ? engines[selectedVoice?.engine || "chatterbox"] : null}
+          />
 
           {/* Live status banner — always visible feedback, no silent failures */}
           {studioMsg && (
@@ -5092,38 +5349,61 @@ function VoiceStudioView({
             {prompts.map((prompt) => {
               const rec = recordings.find(r => r.id === prompt.id);
               const active = activePrompt === prompt.id;
+              const goodLength = recordElapsed >= 2 && recordElapsed <= 12;
               return (
-                <article className="prompt-row" key={prompt.id}>
-                  <div className="prompt-copy">
-                    <span style={{ fontSize: '0.75rem', color: '#718096', marginRight: '0.5rem' }}>{prompt.id}</span>
-                    <strong>{prompt.text}</strong>
-                    <LanguageBadge language={prompt.language} />
+                <article className={active ? "prompt-row recording" : "prompt-row"} key={prompt.id}>
+                  <div className="prompt-row-top">
+                    <div className="prompt-copy">
+                      <span className="prompt-id">{prompt.id}</span>
+                      <strong>{prompt.text}</strong>
+                      <LanguageBadge language={prompt.language} />
+                    </div>
+                    <div className="quality-strip">
+                      {active ? (
+                        <span className="recording-live"><span className="rec-dot" /> Recording…</span>
+                      ) : rec?.exists ? (
+                        <>
+                          <span
+                            className={`quality ${rec.verdict || rec.quality?.verdict || 'review'}`}
+                            title={rec.reason || rec.quality?.reason || ''}
+                          >
+                            {rec.score ?? rec.quality?.score ?? '—'}/100
+                          </span>
+                          <audio src={absoluteAudioUrl(rec.audio_url) || ""} controls />
+                          <button className="icon-text danger record-small" onClick={() => handleDeleteRecord(prompt.id)} type="button" title="Delete and re-record">
+                            <Trash2 size={14} />
+                          </button>
+                        </>
+                      ) : (
+                        <span className="muted">No recording yet</span>
+                      )}
+                      <button
+                        className={active ? "record-small-circle active" : "record-small-circle"}
+                        onClick={active ? handleStopRecord : () => handleStartRecord(prompt.id)}
+                        type="button"
+                        title={active ? "Stop recording" : "Start recording"}
+                        aria-label={active ? "Stop recording" : "Start recording this sentence"}
+                      >
+                        {active ? <Square size={16} /> : <Mic size={16} />}
+                      </button>
+                    </div>
                   </div>
-                  <div className="quality-strip">
-                    {rec?.exists ? (
-                      <>
-                        <span
-                          className={`quality ${rec.verdict || rec.quality?.verdict || 'review'}`}
-                          title={rec.reason || rec.quality?.reason || ''}
-                        >
-                          {rec.score ?? rec.quality?.score ?? '—'}/100
+                  {active && (
+                    <div className="recording-panel">
+                      <canvas ref={waveCanvasRef} className="rec-wave" />
+                      <div className="rec-meta">
+                        <span className={`rec-timer ${goodLength ? "good" : ""}`}>{fmtDuration(recordElapsed)}</span>
+                        <span className="rec-hint">
+                          {recordElapsed < 2 ? "Read the sentence aloud in your normal voice…"
+                            : goodLength ? "Great length — press stop when you finish the sentence."
+                            : "That's plenty — press stop now."}
                         </span>
-                        <audio src={absoluteAudioUrl(rec.audio_url) || ""} controls />
-                        <button className="icon-text danger record-small" onClick={() => handleDeleteRecord(prompt.id)} type="button" title="Delete and re-record">
-                          <Trash2 size={14} />
+                        <button className="rec-stop-btn" onClick={handleStopRecord} type="button">
+                          <Square size={14} /> Stop
                         </button>
-                      </>
-                    ) : (
-                      <span className="muted">No recording yet</span>
-                    )}
-                  </div>
-                  <button
-                    className={active ? "record-small-circle active" : "record-small-circle"}
-                    onClick={active ? handleStopRecord : () => handleStartRecord(prompt.id)}
-                    type="button"
-                  >
-                    {active ? <Square size={16} /> : <Mic size={16} />}
-                  </button>
+                      </div>
+                    </div>
+                  )}
                 </article>
               );
             })}

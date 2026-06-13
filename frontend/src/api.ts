@@ -368,6 +368,14 @@ export async function getVoicesPrompts(): Promise<any[]> {
   return response.json();
 }
 
+export async function getCloningEngines(): Promise<Record<string, any>> {
+  const response = await fetch(`${API_HTTP}/voices/cloning-engines`);
+  if (!response.ok) {
+    throw new Error("Unable to read voice-cloning engine status.");
+  }
+  return response.json();
+}
+
 export async function getAuditLogs(): Promise<any[]> {
   const response = await fetch(`${API_HTTP}/audit/logs`);
   if (!response.ok) {
